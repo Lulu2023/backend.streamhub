@@ -399,46 +399,80 @@ export default {
         fetchTF1(),
       ]);
 
-      // 2. Extraire les banners RTBF + highlights TF1 (hero carousel)
+      // 2. Banners RTBF — chaque widget BANNER doit être fetché individuellement.
+      //    La home retourne seulement { type, id, contentPath } ; le détail
+      //    (title, description, image, deepLink, backgroundColor) est dans la réponse du widget.
       const heroBanners: any[] = [];
       if (rtbfHome.status === 'fulfilled') {
-        const allWidgets = rtbfHome.value?.data?.widgets ?? [];
-        for (const w of allWidgets) {
-          if (w.type === 'BANNER' && w.data) {
-            heroBanners.push({
-              id: w.data.id ?? w.id ?? String(Math.random()),
-              title: w.data.title ?? '',
-              description: w.data.description ?? '',
-              image: w.data.image ?? null,
-              deepLink: w.data.deepLink ?? null,
-              backgroundColor: w.data.backgroundColor ?? '#000000',
-              platform: 'RTBF',
-            });
-          }
+        const bannerWidgets = (rtbfHome.value?.data?.widgets ?? [])
+          .filter((w: any) => w.type === 'BANNER' && w.contentPath);
+
+        const bannerResults = await Promise.allSettled(
+          bannerWidgets.map((w: any) =>
+            fetch(w.contentPath, { headers: { Accept: 'application/json' } })
+              .then((r: Response) => r.ok ? r.json() : null)
+          )
+        );
+
+        for (const res of bannerResults) {
+          if (res.status !== 'fulfilled' || !res.value) continue;
+          const d = res.value?.data;
+          if (!d?.title) continue;
+          heroBanners.push({
+            id: `rtbf-banner-${d.id ?? Math.random()}`,
+            title: d.title,
+            description: d.description ?? '',
+            image: d.image ?? null,
+            deepLink: d.deepLink ?? null,
+            backgroundColor: d.backgroundColor ?? '#000000',
+            platform: 'RTBF',
+          });
         }
       }
+
+      // 2b. Banners TF1 — homeCoversByRight
+      //     Structure : { id, __typename, decoration:{ catchPhrase, cover, coverSmall, label },
+      //                   live?:{ program }, video?:{ program }, program? }
       if (tf1Raw.status === 'fulfilled') {
-        // homeCoversByRight = tableau plat de covers hero TF1
         const covers: any[] = tf1Raw.value?._tf1Banners ?? [];
+
+        const pickBest = (sources: any[] = []) =>
+          [...sources].sort((a: any, b: any) => (b.scale ?? 0) - (a.scale ?? 0))[0]?.url;
+
         for (const cover of covers.slice(0, 6)) {
-          const id    = cover.id ?? cover.program?.id;
-          const title = cover.title ?? cover.program?.decoration?.label ?? cover.program?.name ?? '';
-          const desc  = cover.description ?? cover.program?.decoration?.catchPhrase ?? '';
-          const imgUrl = cover.image?.url
-            ?? [...(cover.image?.sourcesWithScales ?? [])].sort((a: any, b: any) => (b.scale ?? 0) - (a.scale ?? 0))[0]?.url;
+          const dec  = cover.decoration ?? {};
+          const prog = cover.live?.program ?? cover.video?.program ?? cover.program ?? {};
+          const id   = cover.id;
+          const title = dec.label ?? prog.name ?? '';
+          const desc  = dec.catchPhrase ?? dec.description ?? '';
+
+          const imgLandscape = pickBest(dec.cover?.sourcesWithScales);
+          const imgPortrait  = pickBest(dec.coverSmall?.sourcesWithScales);
+          const image = (imgLandscape || imgPortrait) ? {
+            xs:  imgPortrait  ?? imgLandscape,
+            s:   imgPortrait  ?? imgLandscape,
+            m:   imgLandscape ?? imgPortrait,
+            l:   imgLandscape ?? imgPortrait,
+            xl:  imgLandscape ?? imgPortrait,
+          } : null;
+
+          const slug     = prog.slug ?? null;
+          const deepLink = slug ? `/tf1/program/${slug}` : null;
+
           if (id && title) {
             heroBanners.push({
               id: `tf1-banner-${id}`,
               title,
               description: desc,
-              image: imgUrl ? { xs: imgUrl, s: imgUrl, m: imgUrl, l: imgUrl, xl: imgUrl } : null,
-              deepLink: cover.link ?? (cover.program?.slug ? `/tf1/program/${cover.program.slug}` : null),
+              image,
+              deepLink,
               backgroundColor: '#000000',
               platform: 'TF1+',
             });
           }
         }
-        // Fallback si homeCoversByRight vide : premier slider homepage
+
+        // Fallback si homeCoversByRight vide
         if (covers.length === 0) {
           const sliders: any[] = tf1Raw.value?.data?.homeSliders ?? [];
           for (const item of (sliders[0]?.items ?? []).slice(0, 5)) {
