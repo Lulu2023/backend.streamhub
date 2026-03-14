@@ -271,21 +271,7 @@ async function fetchTF1(): Promise<any> {
     ...(homeJson ?? {}),
     _tf1Banners: bannersJson?.data?.homeCoversByRight ?? [],
   };
-}gler
- *   wrangler login
- *   wrangler deploy
- *
- * Une seule requête depuis le téléphone :
- *   GET /home  →  { buckets: ThematicBucket[] }
- *
- * Le Worker fait les requêtes RTBF + TF1 en parallèle côté serveur,
- * classifie les labels inconnus via Cloudflare Workers AI (gratuit),
- * et renvoie des buckets prêts.
- *
- * Bindings à ajouter dans le dashboard Cloudflare (Workers & Pages → ton worker → Settings) :
- *   - KV Namespace : LABEL_CACHE  (créer via Storage & Databases → KV)
- *   - Workers AI   : AI           (activer via AI → Workers AI → Enable)
- */
+}
 
 export interface Env {
   // Workers AI — binding natif Cloudflare, gratuit jusqu'à 10 000 req/jour
