@@ -1,0 +1,444 @@
+/**
+ * Cloudflare Worker — Aggregateur multi-plateforme
+ *
+ * Déploiement :
+ *   npm install -g wrangler
+ *   wrangler login
+ *   wrangler deploy
+ *
+ * Une seule requête depuis le téléphone :
+ *   GET /home  →  { buckets: ThematicBucket[] }
+ *
+ * Le Worker fait les requêtes RTBF + TF1 en parallèle côté serveur
+ * (fibre datacenter, beaucoup plus rapide que depuis un mobile),
+ * classifie les labels inconnus via Ollama, et renvoie des buckets prêts.
+ *
+ * Variables d'environnement à définir dans wrangler.toml ou le dashboard CF :
+ *   OLLAMA_URL  = https://ton-ollama.exemple.com  (ton instance Ollama exposée)
+ *   OLLAMA_MODEL = minimax-m2.5:cloud             (ou llama3, mistral, etc.)
+ */
+
+export interface Env {
+  OLLAMA_URL: string;
+  OLLAMA_MODEL: string;
+  // KV namespace pour le cache des labels — à créer : wrangler kv:namespace create LABEL_CACHE
+  LABEL_CACHE: KVNamespace;
+}
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+type ThemeKey = 'thriller' | 'films' | 'documentaire' | 'culture' | 'info' | 'kids' | 'sport' | 'series';
+
+interface NormalizedItem {
+  id: string;
+  title: string;
+  subtitle?: string;
+  description?: string;
+  illustration?: Record<string, string>;
+  duration?: number;
+  categoryLabel?: string;
+  platform: 'RTBF' | 'TF1+';
+  channelLabel?: string;
+  resourceType?: string;
+  path?: string;
+  rating?: string | null;
+  theme: ThemeKey;
+  _raw: any;
+}
+
+interface ThematicBucket {
+  theme: ThemeKey;
+  label: string;
+  emoji: string;
+  items: NormalizedItem[];
+}
+
+// ─── Constantes ───────────────────────────────────────────────────────────────
+
+const CATEGORY_MAP: Record<string, ThemeKey> = {
+  'policier': 'thriller', 'affaires criminelles': 'thriller', 'crime': 'thriller',
+  'thriller': 'thriller', 'serie policiere': 'thriller', 'série policière': 'thriller',
+  'police': 'thriller', 'suspense': 'thriller', 'horreur': 'thriller',
+  'film': 'films', 'films': 'films', 'comédie': 'films', 'comedie': 'films',
+  'action': 'films', 'aventure': 'films', 'science-fiction': 'films', 'sf': 'films',
+  'animation': 'films', 'romance': 'films', 'western': 'films', 'biopic': 'films',
+  'téléfilm': 'films', 'telefilm': 'films', 'drame': 'films',
+  'documentaire': 'documentaire', 'investigation': 'documentaire', 'société': 'documentaire',
+  'histoire': 'documentaire', 'découvertes': 'documentaire', 'reportage': 'documentaire',
+  'nature': 'documentaire', 'science': 'documentaire', 'environnement': 'documentaire',
+  'voyage': 'documentaire',
+  'culture': 'culture', 'divertissement': 'culture', 'humour': 'culture',
+  'musique': 'culture', 'talk show': 'culture', 'variétés': 'culture', 'magazine': 'culture',
+  'lifestyle': 'culture',
+  'info': 'info', 'actualité': 'info', 'actualités': 'info', 'journal': 'info',
+  'politique': 'info', 'économie': 'info', 'news': 'info', 'débat': 'info',
+  'kids': 'kids', 'enfants': 'kids', 'jeunesse': 'kids', 'animé': 'kids', 'anime': 'kids',
+  'dessin animé': 'kids',
+  'sport': 'sport', 'football': 'sport', 'cyclisme': 'sport', 'tennis': 'sport',
+  'rugby': 'sport', 'formule 1': 'sport', 'athlétisme': 'sport',
+  'serie': 'series', 'série': 'series', 'sitcom': 'series', 'feuilleton': 'series',
+};
+
+const THEMES: Record<ThemeKey, { label: string; emoji: string }> = {
+  thriller:     { label: 'Policier & Thriller',      emoji: '🔍' },
+  films:        { label: 'Films',                    emoji: '🎬' },
+  documentaire: { label: 'Documentaires',            emoji: '📽️' },
+  culture:      { label: 'Culture & Divertissement', emoji: '🎭' },
+  info:         { label: 'Info & Actualités',        emoji: '📰' },
+  series:       { label: 'Séries',                   emoji: '📺' },
+  kids:         { label: 'Kids',                     emoji: '🌟' },
+  sport:        { label: 'Sport',                    emoji: '⚽' },
+};
+
+const BUCKET_ORDER: ThemeKey[] = ['thriller', 'films', 'series', 'documentaire', 'culture', 'info', 'sport', 'kids'];
+
+// ─── Classification ───────────────────────────────────────────────────────────
+
+function resolveThemeSync(categoryLabel: string | undefined, durationSec: number | undefined, llmCache: Record<string, ThemeKey>): ThemeKey {
+  if (!categoryLabel) return 'series';
+  const key = categoryLabel.toLowerCase().trim();
+
+  const mapped = CATEGORY_MAP[key];
+  if (mapped) {
+    if ((key === 'drame' || key === 'comédie' || key === 'comedie') && durationSec && durationSec > 4800) return 'films';
+    return mapped;
+  }
+
+  for (const [fragment, theme] of Object.entries(CATEGORY_MAP)) {
+    if (key.includes(fragment)) return theme;
+  }
+
+  if (llmCache[key]) return llmCache[key];
+
+  return 'series'; // sera résolu par Ollama après
+}
+
+/**
+ * Envoie les labels inconnus à Ollama en un seul appel.
+ * Retourne un map label → ThemeKey.
+ */
+async function classifyWithOllama(
+  unknownLabels: string[],
+  env: Env,
+): Promise<Record<string, ThemeKey>> {
+  if (unknownLabels.length === 0) return {};
+
+  const themeKeys = Object.keys(THEMES).join(', ');
+  const prompt = `Tu es un classificateur de genres vidéo.
+Pour chaque label ci-dessous, retourne le thème le plus proche parmi : ${themeKeys}.
+Réponds UNIQUEMENT avec un objet JSON valide, sans texte autour.
+Format : { "label": "theme", ... }
+
+Labels :
+${unknownLabels.map(l => `- "${l}"`).join('\n')}`;
+
+  try {
+    const response = await fetch(`${env.OLLAMA_URL}/api/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: env.OLLAMA_MODEL,
+        prompt,
+        stream: false,
+        format: 'json',
+      }),
+    });
+
+    if (!response.ok) throw new Error(`Ollama ${response.status}`);
+
+    const data: any = await response.json();
+    const text: string = data.response ?? '';
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error('Réponse Ollama non parseable');
+
+    const result: Record<string, string> = JSON.parse(jsonMatch[0]);
+    const valid: Record<string, ThemeKey> = {};
+
+    for (const [label, theme] of Object.entries(result)) {
+      if (Object.keys(THEMES).includes(theme)) {
+        valid[label.toLowerCase().trim()] = theme as ThemeKey;
+      }
+    }
+
+    return valid;
+  } catch (err) {
+    console.error('[worker] Ollama classification failed:', err);
+    return {};
+  }
+}
+
+// ─── Fetch plateformes ────────────────────────────────────────────────────────
+
+async function fetchRTBF(): Promise<any> {
+  const url = 'https://bff-service.rtbf.be/auvio/v1.23/pages/home?userAgent=Chrome-web-3.0';
+  const res = await fetch(url, { headers: { 'Accept': 'application/json' } });
+  if (!res.ok) throw new Error(`RTBF ${res.status}`);
+  return res.json();
+}
+
+async function fetchRTBFWidget(contentPath: string): Promise<any[]> {
+  try {
+    const url = contentPath.startsWith('http') ? contentPath : `https://bff-service.rtbf.be${contentPath}`;
+    const res = await fetch(`${url}${url.includes('?') ? '&' : '?'}_limit=20&_embed=content`, {
+      headers: { 'Accept': 'application/json' },
+    });
+    if (!res.ok) return [];
+    const json = await res.json();
+    return json?.data?.content ?? json?.data ?? [];
+  } catch {
+    return [];
+  }
+}
+
+async function fetchTF1(): Promise<any> {
+  // GraphQL TF1 — query identique à celle utilisée dans tf1plus-api.ts
+  const query = `{
+    homeSliders(country: "BE", platform: "web") {
+      id
+      decoration { label }
+      items {
+        __typename
+        ... on Video {
+          id duration title
+          typology genre
+          synopsis
+          decoration { label shortLabel }
+          image { sourcesWithScales { url type scale } }
+          accessibility { subtitles audioDescription }
+        }
+        ... on Program {
+          id
+          typology genre
+          decoration { label catchPhrase portrait { sourcesWithScales { url type scale } } }
+          program { id typology genre synopsis }
+        }
+        ... on TopProgramItem {
+          program {
+            id typology genre
+            decoration { label catchPhrase portrait { sourcesWithScales { url type scale } } }
+          }
+        }
+      }
+    }
+  }`;
+
+  const res = await fetch('https://www.tf1.fr/graphql/fr-be/web', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    },
+    body: JSON.stringify({ query }),
+  });
+  if (!res.ok) throw new Error(`TF1 ${res.status}`);
+  return res.json();
+}
+
+// ─── Normalisation ────────────────────────────────────────────────────────────
+
+function normalizeRTBFItem(item: any, llmCache: Record<string, ThemeKey>): NormalizedItem | null {
+  if (!item || item.resourceType === 'LIVE') return null;
+  const theme = resolveThemeSync(item.categoryLabel, item.duration, llmCache);
+  return {
+    id: `rtbf-${item.id ?? item.assetId}`,
+    title: item.title ?? '',
+    subtitle: item.subtitle,
+    description: item.description,
+    illustration: item.illustration,
+    duration: item.duration,
+    categoryLabel: item.categoryLabel,
+    platform: 'RTBF',
+    channelLabel: item.channelLabel,
+    resourceType: item.resourceType,
+    path: item.path,
+    rating: item.rating,
+    theme,
+    _raw: item,
+  };
+}
+
+function normalizeTF1Item(item: any, llmCache: Record<string, ThemeKey>): NormalizedItem | null {
+  if (!item) return null;
+
+  const isFilm = item.typology === 'Film' || item.__typename === 'Video' && item.genre === 'Film';
+  const rawCategory =
+    item.typology
+    ?? item.genre
+    ?? item.program?.typology
+    ?? item.program?.genre
+    ?? (isFilm ? 'Film' : undefined)
+    ?? (item.__typename === 'Video' ? 'Divertissement' : 'Série');
+
+  const theme = resolveThemeSync(rawCategory, item.duration, llmCache);
+
+  // Image
+  const sourcesWithScales =
+    item.image?.sourcesWithScales
+    ?? item.decoration?.portrait?.sourcesWithScales
+    ?? item.program?.decoration?.portrait?.sourcesWithScales
+    ?? [];
+  const bestUrl = sourcesWithScales.sort((a: any, b: any) => (b.scale ?? 0) - (a.scale ?? 0))[0]?.url;
+  const illustration = bestUrl ? { xs: bestUrl, s: bestUrl, m: bestUrl, l: bestUrl, xl: bestUrl } : undefined;
+
+  const id = item.id ?? item.program?.id;
+  const title = item.decoration?.label ?? item.title ?? item.program?.decoration?.label ?? '';
+  if (!title || !id) return null;
+
+  return {
+    id: `tf1-${id}`,
+    title,
+    subtitle: item.decoration?.catchPhrase ?? item.program?.decoration?.catchPhrase,
+    description: item.synopsis ?? item.program?.synopsis ?? item.program?.decoration?.description,
+    illustration,
+    duration: item.duration ?? 0,
+    categoryLabel: rawCategory,
+    platform: 'TF1+',
+    channelLabel: 'TF1+',
+    resourceType: item.__typename === 'Video' ? 'MEDIA' : 'PROGRAM',
+    path: `/tf1/${item.__typename === 'Video' ? 'video' : 'program'}/${id}`,
+    theme,
+    _raw: item,
+  };
+}
+
+// ─── Déduplication ────────────────────────────────────────────────────────────
+
+function deduplicate(items: NormalizedItem[]): NormalizedItem[] {
+  const seen = new Map<string, NormalizedItem>();
+  for (const item of items) {
+    const key = `${item.platform}:${item.title.toLowerCase().trim().replace(/\s+/g, ' ')}`;
+    if (!seen.has(key)) seen.set(key, item);
+  }
+  return Array.from(seen.values());
+}
+
+// ─── Build buckets ────────────────────────────────────────────────────────────
+
+function buildBuckets(items: NormalizedItem[], maxPerBucket = 20): ThematicBucket[] {
+  const groups = new Map<ThemeKey, NormalizedItem[]>();
+  for (const theme of BUCKET_ORDER) groups.set(theme, []);
+
+  for (const item of items) {
+    groups.get(item.theme)?.push(item);
+  }
+
+  return BUCKET_ORDER
+    .map(theme => ({
+      theme,
+      label: THEMES[theme].label,
+      emoji: THEMES[theme].emoji,
+      items: (groups.get(theme) ?? []).slice(0, maxPerBucket),
+    }))
+    .filter(b => b.items.length > 0);
+}
+
+// ─── Handler principal ────────────────────────────────────────────────────────
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+
+    // CORS pour le téléphone
+    const corsHeaders = {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type',
+    };
+
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { headers: corsHeaders });
+    }
+
+    if (url.pathname !== '/home') {
+      return new Response('Not found', { status: 404, headers: corsHeaders });
+    }
+
+    try {
+      // 1. Fetch RTBF + TF1 en parallèle
+      const [rtbfHome, tf1Raw] = await Promise.allSettled([
+        fetchRTBF(),
+        fetchTF1(),
+      ]);
+
+      // 2. Charger les widgets RTBF (contentPath → items)
+      let rtbfItems: NormalizedItem[] = [];
+      if (rtbfHome.status === 'fulfilled') {
+        const EXCLUDED = new Set(['FAVORITE_PROGRAM_LIST', 'CHANNEL_LIST', 'ONGOING_PLAY_HISTORY', 'CATEGORY_LIST', 'PROMOBOX', 'BANNER', 'MEDIA_TRAILER']);
+        const widgets = rtbfHome.value?.data?.widgets ?? [];
+        const widgetFetches = widgets
+          .filter((w: any) => !EXCLUDED.has(w.type) && w.contentPath)
+          .map((w: any) => fetchRTBFWidget(w.contentPath));
+
+        const widgetResults = await Promise.allSettled(widgetFetches);
+
+        // Lire le cache LLM depuis KV
+        const llmCacheRaw = await env.LABEL_CACHE.get('label_map');
+        const llmCache: Record<string, ThemeKey> = llmCacheRaw ? JSON.parse(llmCacheRaw) : {};
+
+        for (const result of widgetResults) {
+          if (result.status !== 'fulfilled') continue;
+          for (const raw of result.value) {
+            const item = normalizeRTBFItem(raw, llmCache);
+            if (item) rtbfItems.push(item);
+          }
+        }
+      }
+
+      // 3. Normaliser TF1
+      let tf1Items: NormalizedItem[] = [];
+      const llmCacheRaw = await env.LABEL_CACHE.get('label_map');
+      const llmCache: Record<string, ThemeKey> = llmCacheRaw ? JSON.parse(llmCacheRaw) : {};
+
+      if (tf1Raw.status === 'fulfilled') {
+        const sliders = tf1Raw.value?.data?.homeSliders ?? [];
+        for (const slider of sliders) {
+          for (const item of slider.items ?? []) {
+            const normalized = normalizeTF1Item(item, llmCache);
+            if (normalized) tf1Items.push(normalized);
+          }
+        }
+      }
+
+      // 4. Trouver les labels inconnus et les classifier avec Ollama
+      const allItems = deduplicate([...rtbfItems, ...tf1Items]);
+      const unknownLabels = [...new Set(
+        allItems
+          .filter(i => i.theme === 'series' && i.categoryLabel)
+          .map(i => i.categoryLabel!.toLowerCase().trim())
+          .filter(l => !CATEGORY_MAP[l] && !llmCache[l])
+      )];
+
+      if (unknownLabels.length > 0 && env.OLLAMA_URL) {
+        const newMappings = await classifyWithOllama(unknownLabels, env);
+
+        if (Object.keys(newMappings).length > 0) {
+          // Persister dans KV (TTL 7 jours)
+          const updatedCache = { ...llmCache, ...newMappings };
+          await env.LABEL_CACHE.put('label_map', JSON.stringify(updatedCache), { expirationTtl: 604800 });
+
+          // Reclassifier les items qui étaient en fallback
+          for (const item of allItems) {
+            if (item.theme === 'series' && item.categoryLabel) {
+              const key = item.categoryLabel.toLowerCase().trim();
+              if (newMappings[key]) item.theme = newMappings[key];
+            }
+          }
+        }
+      }
+
+      // 5. Construire les buckets et répondre
+      const buckets = buildBuckets(allItems);
+
+      return new Response(JSON.stringify({ buckets, meta: { rtbf: rtbfItems.length, tf1: tf1Items.length } }), {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=300' },
+      });
+
+    } catch (err: any) {
+      console.error('[worker] Error:', err);
+      return new Response(JSON.stringify({ error: err.message }), {
+        status: 500,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+  },
+};
