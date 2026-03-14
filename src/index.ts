@@ -56,27 +56,59 @@ interface ThematicBucket {
 // ─── Constantes ───────────────────────────────────────────────────────────────
 
 const CATEGORY_MAP: Record<string, ThemeKey> = {
+  // ── Policier / Thriller ──────────────────────────────────────────────────
   'policier': 'thriller', 'affaires criminelles': 'thriller', 'crime': 'thriller',
   'thriller': 'thriller', 'serie policiere': 'thriller', 'série policière': 'thriller',
   'police': 'thriller', 'suspense': 'thriller', 'horreur': 'thriller',
-  'film': 'films', 'films': 'films', 'comédie': 'films', 'comedie': 'films',
-  'action': 'films', 'aventure': 'films', 'science-fiction': 'films', 'sf': 'films',
-  'animation': 'films', 'romance': 'films', 'western': 'films', 'biopic': 'films',
-  'téléfilm': 'films', 'telefilm': 'films', 'drame': 'films',
-  'documentaire': 'documentaire', 'investigation': 'documentaire', 'société': 'documentaire',
-  'histoire': 'documentaire', 'découvertes': 'documentaire', 'reportage': 'documentaire',
-  'nature': 'documentaire', 'science': 'documentaire', 'environnement': 'documentaire',
-  'voyage': 'documentaire',
+  'espionnage': 'thriller',
+
+  // ── Films ────────────────────────────────────────────────────────────────
+  // NB : "drame" et "comédie dramatique" sont traités via heuristique durée
+  'film': 'films', 'films': 'films',
+  'comédie': 'films', 'comedie': 'films',
+  'comédie dramatique': 'films', 'comedie dramatique': 'films',
+  'action': 'films', 'aventure': 'films',
+  'science-fiction': 'films', 'sf': 'films', 'fantastique': 'films',
+  'animation': 'films', 'romance': 'films', 'western': 'films',
+  'biopic': 'films', 'téléfilm': 'films', 'telefilm': 'films',
+  'drame': 'films', 'cinema': 'films',
+
+  // ── Documentaire ─────────────────────────────────────────────────────────
+  'documentaire': 'documentaire', 'investigation': 'documentaire',
+  'société': 'documentaire', 'societe': 'documentaire',
+  'histoire': 'documentaire', 'découvertes': 'documentaire', 'decouvertes': 'documentaire',
+  'reportage': 'documentaire', 'nature': 'documentaire', 'science': 'documentaire',
+  'environnement': 'documentaire', 'voyage': 'documentaire',
+  'monde': 'documentaire',
+
+  // ── Culture & Divertissement ──────────────────────────────────────────────
   'culture': 'culture', 'divertissement': 'culture', 'humour': 'culture',
-  'musique': 'culture', 'talk show': 'culture', 'variétés': 'culture', 'magazine': 'culture',
-  'lifestyle': 'culture',
+  'musique': 'culture', 'talk show': 'culture', 'variétés': 'culture',
+  'varietes': 'culture', 'magazine': 'culture', 'lifestyle': 'culture',
+  'spectacle': 'culture', 'concert': 'culture',
+  'people & musique': 'culture', 'people': 'culture',
+  'litterature': 'culture', 'littérature': 'culture',
+  'jeux': 'culture',  // jeux TV (Billets doux, Génies en herbe) = divertissement adulte
+  'jeux & divertissements': 'culture',
+
+  // ── Info & Actualités ─────────────────────────────────────────────────────
   'info': 'info', 'actualité': 'info', 'actualités': 'info', 'journal': 'info',
-  'politique': 'info', 'économie': 'info', 'news': 'info', 'débat': 'info',
-  'kids': 'kids', 'enfants': 'kids', 'jeunesse': 'kids', 'animé': 'kids', 'anime': 'kids',
-  'dessin animé': 'kids',
+  'politique': 'info', 'économie': 'info', 'economie': 'info',
+  'news': 'info', 'débat': 'info', 'debat': 'info',
+  'information': 'info',  // typology TF1
+
+  // ── Kids ──────────────────────────────────────────────────────────────────
+  'kids': 'kids', 'enfants': 'kids', 'jeunesse': 'kids',
+  'animé': 'kids', 'anime': 'kids', 'dessin animé': 'kids',
+
+  // ── Sport ─────────────────────────────────────────────────────────────────
   'sport': 'sport', 'football': 'sport', 'cyclisme': 'sport', 'tennis': 'sport',
   'rugby': 'sport', 'formule 1': 'sport', 'athlétisme': 'sport',
+  'moteurs': 'sport', 'basket': 'sport', 'natation': 'sport',
+
+  // ── Séries (fallback) ─────────────────────────────────────────────────────
   'serie': 'series', 'série': 'series', 'sitcom': 'series', 'feuilleton': 'series',
+  'mini serie': 'series', 'mini série': 'series',
 };
 
 const THEMES: Record<ThemeKey, { label: string; emoji: string }> = {
@@ -98,19 +130,34 @@ function resolveThemeSync(categoryLabel: string | undefined, durationSec: number
   if (!categoryLabel) return 'series';
   const key = categoryLabel.toLowerCase().trim();
 
+  // 1. Lookup exact
   const mapped = CATEGORY_MAP[key];
   if (mapped) {
-    if ((key === 'drame' || key === 'comédie' || key === 'comedie') && durationSec && durationSec > 4800) return 'films';
+    // Heuristique durée : drame/comédie >80min → film, sinon série
+    const isDramaOrComedy = ['drame', 'comédie', 'comedie', 'comédie dramatique', 'comedie dramatique'].includes(key);
+    if (isDramaOrComedy && durationSec !== undefined) {
+      return durationSec > 4800 ? 'films' : 'series';
+    }
     return mapped;
   }
 
+  // 2. Fuzzy : le label COMMENCE PAR un fragment connu (évite les faux positifs)
+  //    Ex : "comédie dramatique" commence par "comédie" ✓
+  //    Mais "spectacle" ne commence pas par "sport" ✓ (pas de faux positif)
   for (const [fragment, theme] of Object.entries(CATEGORY_MAP)) {
-    if (key.includes(fragment)) return theme;
+    if (key.startsWith(fragment)) return theme;
   }
 
+  // 3. Fuzzy élargi : contient le fragment (seulement pour les fragments longs ≥6 chars)
+  for (const [fragment, theme] of Object.entries(CATEGORY_MAP)) {
+    if (fragment.length >= 6 && key.includes(fragment)) return theme;
+  }
+
+  // 4. Cache AI
   if (llmCache[key]) return llmCache[key];
 
-  return 'series'; // sera résolu par Ollama après
+  // 5. Fallback — ce label sera envoyé à Workers AI
+  return 'series';
 }
 
 /**
@@ -404,7 +451,7 @@ export default {
         }
       }
 
-      // 4. Trouver les labels inconnus et les classifier avec Ollama
+      // 4. Trouver les labels inconnus et les classifier avec Workers AI
       const allItems = deduplicate([...rtbfItems, ...tf1Items]);
       const unknownLabels = [...new Set(
         allItems
@@ -413,15 +460,16 @@ export default {
           .filter(l => !CATEGORY_MAP[l] && !llmCache[l])
       )];
 
+      let newMappings: Record<string, ThemeKey> = {};
+
       if (unknownLabels.length > 0) {
-        const newMappings = await classifyWithWorkersAI(unknownLabels, env);
+        console.log('[worker] Labels inconnus envoyés à Workers AI:', unknownLabels);
+        newMappings = await classifyWithWorkersAI(unknownLabels, env);
 
         if (Object.keys(newMappings).length > 0) {
-          // Persister dans KV (TTL 7 jours)
           const updatedCache = { ...llmCache, ...newMappings };
           await env.LABEL_CACHE.put('label_map', JSON.stringify(updatedCache), { expirationTtl: 604800 });
 
-          // Reclassifier les items qui étaient en fallback
           for (const item of allItems) {
             if (item.theme === 'series' && item.categoryLabel) {
               const key = item.categoryLabel.toLowerCase().trim();
@@ -434,7 +482,15 @@ export default {
       // 5. Construire les buckets et répondre
       const buckets = buildBuckets(allItems);
 
-      return new Response(JSON.stringify({ buckets, meta: { rtbf: rtbfItems.length, tf1: tf1Items.length } }), {
+      return new Response(JSON.stringify({
+        buckets,
+        meta: {
+          rtbf: rtbfItems.length,
+          tf1: tf1Items.length,
+          unknownLabelsClassifiedByAI: Object.keys(newMappings ?? {}),
+          totalUnknownLabels: unknownLabels.length,
+        }
+      }), {
         headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=300' },
       });
 
