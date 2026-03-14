@@ -19,5 +19,5 @@ binding = "AI"
 # Créer avec : wrangler kv:namespace create LABEL_CACHE
 # Puis remplacer l'id ci-dessous par celui retourné
 [[kv_namespaces]]
-binding = "backend"
+binding = "LABEL_CACHE"
 id = "4075fb3d1bdc42f8a94dd012dc91470f"
