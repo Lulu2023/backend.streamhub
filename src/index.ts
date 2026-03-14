@@ -9,19 +9,19 @@
  * Une seule requête depuis le téléphone :
  *   GET /home  →  { buckets: ThematicBucket[] }
  *
- * Le Worker fait les requêtes RTBF + TF1 en parallèle côté serveur
- * (fibre datacenter, beaucoup plus rapide que depuis un mobile),
- * classifie les labels inconnus via Ollama, et renvoie des buckets prêts.
+ * Le Worker fait les requêtes RTBF + TF1 en parallèle côté serveur,
+ * classifie les labels inconnus via Cloudflare Workers AI (gratuit),
+ * et renvoie des buckets prêts.
  *
- * Variables d'environnement à définir dans wrangler.toml ou le dashboard CF :
- *   OLLAMA_URL  = https://ton-ollama.exemple.com  (ton instance Ollama exposée)
- *   OLLAMA_MODEL = minimax-m2.5:cloud             (ou llama3, mistral, etc.)
+ * Bindings à ajouter dans le dashboard Cloudflare (Workers & Pages → ton worker → Settings) :
+ *   - KV Namespace : LABEL_CACHE  (créer via Storage & Databases → KV)
+ *   - Workers AI   : AI           (activer via AI → Workers AI → Enable)
  */
 
 export interface Env {
-  OLLAMA_URL: string;
-  OLLAMA_MODEL: string;
-  // KV namespace pour le cache des labels — à créer : wrangler kv:namespace create LABEL_CACHE
+  // Workers AI — binding natif Cloudflare, gratuit jusqu'à 10 000 req/jour
+  AI: Ai;
+  // KV namespace pour le cache des labels classifiés
   LABEL_CACHE: KVNamespace;
 }
 
@@ -117,7 +117,7 @@ function resolveThemeSync(categoryLabel: string | undefined, durationSec: number
  * Envoie les labels inconnus à Ollama en un seul appel.
  * Retourne un map label → ThemeKey.
  */
-async function classifyWithOllama(
+async function classifyWithWorkersAI(
   unknownLabels: string[],
   env: Env,
 ): Promise<Record<string, ThemeKey>> {
@@ -133,23 +133,15 @@ Labels :
 ${unknownLabels.map(l => `- "${l}"`).join('\n')}`;
 
   try {
-    const response = await fetch(`${env.OLLAMA_URL}/api/generate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: env.OLLAMA_MODEL,
-        prompt,
-        stream: false,
-        format: 'json',
-      }),
+    // Workers AI — Llama 3 8B, gratuit jusqu'à 10 000 req/jour
+    const response = await env.AI.run('@cf/meta/llama-3-8b-instruct', {
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: 512,
     });
 
-    if (!response.ok) throw new Error(`Ollama ${response.status}`);
-
-    const data: any = await response.json();
-    const text: string = data.response ?? '';
+    const text = (response as any).response ?? '';
     const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error('Réponse Ollama non parseable');
+    if (!jsonMatch) throw new Error('Réponse Workers AI non parseable');
 
     const result: Record<string, string> = JSON.parse(jsonMatch[0]);
     const valid: Record<string, ThemeKey> = {};
@@ -162,7 +154,7 @@ ${unknownLabels.map(l => `- "${l}"`).join('\n')}`;
 
     return valid;
   } catch (err) {
-    console.error('[worker] Ollama classification failed:', err);
+    console.error('[worker] Workers AI classification failed:', err);
     return {};
   }
 }
@@ -420,8 +412,8 @@ export default {
           .filter(l => !CATEGORY_MAP[l] && !llmCache[l])
       )];
 
-      if (unknownLabels.length > 0 && env.OLLAMA_URL) {
-        const newMappings = await classifyWithOllama(unknownLabels, env);
+      if (unknownLabels.length > 0) {
+        const newMappings = await classifyWithWorkersAI(unknownLabels, env);
 
         if (Object.keys(newMappings).length > 0) {
           // Persister dans KV (TTL 7 jours)
