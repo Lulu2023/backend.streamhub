@@ -2,18 +2,12 @@ name = "backend-streamhub"
 main = "src/index.ts"
 compatibility_date = "2024-01-01"
 
-# Variables d'environnement (les secrets vont dans wrangler secret put)
-[vars]
-OLLAMA_MODEL = "minimax-m2.5:cloud"
-# OLLAMA_URL → wrangler secret put OLLAMA_URL  (ne pas mettre une URL privée ici)
-name = "backend-streamhub"
-main = "src/index.ts"
-compatibility_date = "2024-01-01"
+[observability]
+enabled = true
 
 # Workers AI — binding natif, gratuit jusqu'à 10 000 req/jour
 [ai]
 binding = "AI"
-
 
 # KV namespace pour le cache des labels Ollama
 # Créer avec : wrangler kv:namespace create LABEL_CACHE
@@ -21,12 +15,3 @@ binding = "AI"
 [[kv_namespaces]]
 binding = "LABEL_CACHE"
 id = "4075fb3d1bdc42f8a94dd012dc91470f"
-
-{
-  "observability": {
-    "logs": {
-      "enabled": false,
-      "invocation_logs": true
-    }
-  }
-}
