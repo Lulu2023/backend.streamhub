@@ -191,44 +191,24 @@ async function fetchRTBFWidget(contentPath: string): Promise<any[]> {
 }
 
 async function fetchTF1(): Promise<any> {
-  // GraphQL TF1 — query identique à celle utilisée dans tf1plus-api.ts
-  const query = `{
-    homeSliders(country: "BE", platform: "web") {
-      id
-      decoration { label }
-      items {
-        __typename
-        ... on Video {
-          id duration title
-          typology genre
-          synopsis
-          decoration { label shortLabel }
-          image { sourcesWithScales { url type scale } }
-          accessibility { subtitles audioDescription }
-        }
-        ... on Program {
-          id
-          typology genre
-          decoration { label catchPhrase portrait { sourcesWithScales { url type scale } } }
-          program { id typology genre synopsis }
-        }
-        ... on TopProgramItem {
-          program {
-            id typology genre
-            decoration { label catchPhrase portrait { sourcesWithScales { url type scale } } }
-          }
-        }
-      }
-    }
-  }`;
+  // TF1 utilise des persisted queries identifiées par un hash — même approche que tf1plus-api.ts
+  const params = new URLSearchParams({
+    id: 'c34093152db844db6b7ad9b56df12841f7d13182',
+    variables: JSON.stringify({
+      ofBannerTypes: [],
+      ofContentTypes: ['TOP_PROGRAM', 'PROGRAM'],
+      ofChannelTypes: [],
+    }),
+  });
 
-  const res = await fetch('https://www.tf1.fr/graphql/fr-be/web', {
-    method: 'POST',
+  const res = await fetch(`https://www.tf1.fr/graphql/fr-be/web?${params}`, {
+    method: 'GET',
     headers: {
-      'Content-Type': 'application/json',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      'content-type': 'application/json',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Origin': 'https://www.tf1.fr',
+      'Referer': 'https://www.tf1.fr/',
     },
-    body: JSON.stringify({ query }),
   });
   if (!res.ok) throw new Error(`TF1 ${res.status}`);
   return res.json();
@@ -390,11 +370,43 @@ export default {
       const llmCache: Record<string, ThemeKey> = llmCacheRaw ? JSON.parse(llmCacheRaw) : {};
 
       if (tf1Raw.status === 'fulfilled') {
+        // La persisted query retourne data.homeSliders (même structure que transformHomePageData)
         const sliders = tf1Raw.value?.data?.homeSliders ?? [];
         for (const slider of sliders) {
           for (const item of slider.items ?? []) {
-            const normalized = normalizeTF1Item(item, llmCache);
-            if (normalized) tf1Items.push(normalized);
+            // Extraire le programme selon le __typename (même logique que transformSliderItem)
+            const prog = item.program ?? item; // TopProgramItem/ProgramItem ont un sous-objet program
+            const id = prog.id ?? item.id;
+            const typology = prog.typology ?? item.typology ?? '';
+            const genre = prog.genre ?? item.genre ?? '';
+            const title = prog.decoration?.label ?? prog.name ?? item.decoration?.label ?? '';
+            if (!title || !id) continue;
+
+            const sourcesWithScales =
+              prog.decoration?.portrait?.sourcesWithScales ??
+              prog.decoration?.image?.sourcesWithScales ??
+              item.image?.sourcesWithScales ?? [];
+            const bestUrl = [...sourcesWithScales].sort((a: any, b: any) => (b.scale ?? 0) - (a.scale ?? 0))[0]?.url;
+            const illustration = bestUrl ? { xs: bestUrl, s: bestUrl, m: bestUrl, l: bestUrl, xl: bestUrl } : undefined;
+
+            const rawCategory = typology || genre || (item.__typename === 'Video' ? 'Divertissement' : 'Série');
+            const theme = resolveThemeSync(rawCategory, item.duration ?? 0, llmCache);
+
+            tf1Items.push({
+              id: `tf1-${id}`,
+              title,
+              subtitle: prog.decoration?.catchPhrase,
+              description: prog.synopsis ?? prog.decoration?.description,
+              illustration,
+              duration: item.duration ?? 0,
+              categoryLabel: rawCategory,
+              platform: 'TF1+',
+              channelLabel: 'TF1+',
+              resourceType: item.__typename === 'Video' ? 'MEDIA' : 'PROGRAM',
+              path: `/tf1/${item.__typename === 'Video' ? 'video' : 'program'}/${id}`,
+              theme,
+              _raw: item,
+            });
           }
         }
       }
