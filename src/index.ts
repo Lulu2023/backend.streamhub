@@ -418,12 +418,36 @@ export default {
           if (res.status !== 'fulfilled' || !res.value) continue;
           const d = res.value?.data;
           if (!d?.title) continue;
+
+          // Extraire le slug et l'ID numérique depuis deepLink, ex: /emission/the-gold-le-casse-du-siecle-31394
+          const deepLink: string | null = d.deepLink ?? null;
+          let contentSlug: string | null = null;
+          let contentId: string | null   = null;
+          let contentType: 'emission' | 'media' | 'other' | null = null;
+          if (deepLink) {
+            const m = deepLink.match(/^\/(emission|media)\/([^/]+?)(?:-(\d+))?$/);
+            if (m) {
+              contentType = m[1] as 'emission' | 'media';
+              contentSlug = m[2] + (m[3] ? `-${m[3]}` : '');
+              contentId   = m[3] ?? null;
+            } else {
+              contentType = 'other';
+            }
+          }
+
           heroBanners.push({
-            id: `rtbf-banner-${d.id ?? Math.random()}`,
-            title: d.title,
+            id:          `rtbf-banner-${d.id ?? Math.random()}`,
+            coverId:     String(d.id ?? ''),
+            title:       d.title,
             description: d.description ?? '',
-            image: d.image ?? null,
-            deepLink: d.deepLink ?? null,
+            image:       d.image ?? null,
+            videoUrl:    null,               // RTBF banners n'ont pas de trailer
+            deepLink,
+            contentType,                     // 'emission' | 'media' | 'other' | null
+            contentId,                       // ID numérique RTBF (string), ex: "31394"
+            contentSlug,                     // slug complet, ex: "the-gold-le-casse-du-siecle-31394"
+            textPosition: d.textPosition ?? 'left',
+            theme:        d.theme ?? 'dark',
             backgroundColor: d.backgroundColor ?? '#000000',
             platform: 'RTBF',
           });
@@ -431,8 +455,10 @@ export default {
       }
 
       // 2b. Banners TF1 — homeCoversByRight
-      //     Structure : { id, __typename, decoration:{ catchPhrase, cover, coverSmall, label },
-      //                   live?:{ program }, video?:{ program }, program? }
+      //   __typename variants:
+      //     CoverOfLive    → live.{ id, title, channel.slug, program.{ id, slug, name, typology, topics } }
+      //     CoverOfVideo   → video.{ id, slug, type, season, episode, playingInfos.duration, program.{ id, slug, name, typology } }
+      //     CoverOfProgram → program.{ id, slug, name, typology } + callToAction.items[0].video.{ id, slug, season, episode }
       if (tf1Raw.status === 'fulfilled') {
         const covers: any[] = tf1Raw.value?._tf1Banners ?? [];
 
@@ -440,11 +466,56 @@ export default {
           [...sources].sort((a: any, b: any) => (b.scale ?? 0) - (a.scale ?? 0))[0]?.url;
 
         for (const cover of covers.slice(0, 6)) {
-          const dec  = cover.decoration ?? {};
-          const prog = cover.live?.program ?? cover.video?.program ?? cover.program ?? {};
-          const id   = cover.id;
-          const title = dec.label ?? prog.name ?? '';
-          const desc  = dec.catchPhrase ?? dec.description ?? '';
+          const dec       = cover.decoration ?? {};
+          const typename  = cover.__typename ?? '';
+
+          // Extraire programme + contenu selon le type
+          const prog      = cover.live?.program ?? cover.video?.program ?? cover.program ?? {};
+          const videoItem = cover.video ?? cover.callToAction?.items?.[0]?.video ?? null;
+          const liveItem  = cover.live ?? null;
+
+          const coverId   = cover.id;
+          const progId    = prog.id ?? null;
+          const progSlug  = prog.slug ?? null;
+          const progName  = prog.name ?? dec.label ?? '';
+          const typology  = prog.typology ?? null;
+          const topics    = prog.topics ?? [];
+
+          // Contenu spécifique selon le type
+          let contentId: string | null   = null;
+          let contentSlug: string | null = null;
+          let contentType: 'live' | 'video' | 'program' = 'program';
+          let season: number | null   = null;
+          let episode: number | null  = null;
+          let duration: number | null = null;
+          let videoRights: string[]   = [];
+
+          if (typename === 'CoverOfLive' && liveItem) {
+            contentId   = liveItem.id ?? null;
+            contentSlug = liveItem.channel?.slug ?? progSlug;
+            contentType = 'live';
+            videoRights = liveItem.rights ?? [];
+          } else if (typename === 'CoverOfVideo' && videoItem) {
+            contentId   = videoItem.id ?? null;
+            contentSlug = videoItem.slug ?? null;
+            contentType = 'video';
+            season      = videoItem.season ?? null;
+            episode     = videoItem.episode ?? null;
+            duration    = videoItem.playingInfos?.duration ?? null;
+            videoRights = videoItem.rights ?? [];
+          } else if (typename === 'CoverOfProgram') {
+            const cta = cover.callToAction?.items?.[0]?.video;
+            contentId   = cta?.id ?? progId;
+            contentSlug = cta?.slug ?? progSlug;
+            contentType = 'program';
+            season      = cta?.season ?? null;
+            episode     = cta?.episode ?? null;
+            duration    = cta?.playingInfos?.duration ?? null;
+            videoRights = cta?.rights ?? [];
+          }
+
+          const title = progName;
+          const desc  = dec.catchPhrase ?? dec.description ?? dec.summary ?? '';
 
           const imgLandscape = pickBest(dec.cover?.sourcesWithScales);
           const imgPortrait  = pickBest(dec.coverSmall?.sourcesWithScales);
@@ -456,16 +527,35 @@ export default {
             xl:  imgLandscape ?? imgPortrait,
           } : null;
 
-          const slug     = prog.slug ?? null;
-          const deepLink = slug ? `/tf1/program/${slug}` : null;
+          const videoUrl = dec.video?.sources?.[0]?.url ?? null;
 
-          if (id && title) {
+          // deepLink : préférer le slug du contenu (video/live) ou du programme
+          const deepLink = contentSlug
+            ? (contentType === 'video'   ? `/tf1/video/${contentSlug}`
+            :  contentType === 'live'    ? `/tf1/live/${contentSlug}`
+            :                              `/tf1/program/${progSlug ?? contentSlug}`)
+            : (progSlug ? `/tf1/program/${progSlug}` : null);
+
+          if (coverId && title) {
             heroBanners.push({
-              id: `tf1-banner-${id}`,
+              id:          `tf1-banner-${coverId}`,
+              coverId,
               title,
               description: desc,
               image,
+              videoUrl,            // trailer MP4 (peut être null)
               deepLink,
+              contentType,         // 'live' | 'video' | 'program'
+              contentId,           // ID de la vidéo/live/programme cible
+              contentSlug,         // slug direct du contenu
+              programId:   progId,
+              programSlug: progSlug,
+              typology,            // 'Émission' | 'Série' | null
+              topics,              // ['Divertissement', 'Chanson', ...]
+              season,
+              episode,
+              duration,            // secondes
+              rights:      videoRights, // ['BASIC', 'MAX', ...]
               backgroundColor: '#000000',
               platform: 'TF1+',
             });
@@ -489,10 +579,23 @@ export default {
             if (id && title) {
               heroBanners.push({
                 id: `tf1-banner-${id}`,
+                coverId: id,
                 title,
                 description: desc,
                 image: bestImg ? { xs: bestImg, s: bestImg, m: bestImg, l: bestImg, xl: bestImg } : null,
+                videoUrl: null,
                 deepLink: `/tf1/program/${id}`,
+                contentType: 'program',
+                contentId: id,
+                contentSlug: null,
+                programId: id,
+                programSlug: null,
+                typology: null,
+                topics: [],
+                season: null,
+                episode: null,
+                duration: null,
+                rights: [],
                 backgroundColor: '#000000',
                 platform: 'TF1+',
               });
