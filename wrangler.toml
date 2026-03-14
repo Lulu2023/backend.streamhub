@@ -21,3 +21,12 @@ binding = "AI"
 [[kv_namespaces]]
 binding = "LABEL_CACHE"
 id = "4075fb3d1bdc42f8a94dd012dc91470f"
+
+{
+  "observability": {
+    "logs": {
+      "enabled": false,
+      "invocation_logs": true
+    }
+  }
+}
