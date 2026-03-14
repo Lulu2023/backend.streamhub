@@ -1,4 +1,4 @@
-name = "streaming-aggregator"
+name = "backend-streamhub"
 main = "src/index.ts"
 compatibility_date = "2024-01-01"
 
@@ -11,5 +11,5 @@ OLLAMA_MODEL = "minimax-m2.5:cloud"
 # Créer avec : wrangler kv:namespace create LABEL_CACHE
 # Puis remplacer l'id ci-dessous par celui retourné
 [[kv_namespaces]]
-binding = "LABEL_CACHE"
-id = "REMPLACER_PAR_TON_KV_ID"
+binding = "backend"
+id = "4075fb3d1bdc42f8a94dd012dc91470f"
