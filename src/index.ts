@@ -134,6 +134,7 @@ ${unknownLabels.map(l => `- "${l}"`).join('\n')}`;
 
   try {
     // Workers AI — Llama 3 8B, gratuit jusqu'à 10 000 req/jour
+    console.log('[AI] Classification de', unknownLabels.length, 'labels:', unknownLabels);
     const response = await env.AI.run('@cf/meta/llama-3-8b-instruct', {
       messages: [{ role: 'user', content: prompt }],
       max_tokens: 512,
