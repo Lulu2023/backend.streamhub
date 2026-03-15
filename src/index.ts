@@ -122,26 +122,57 @@ const CATEGORY_MAP: Record<string, ThemeKey> = {
 
 // Topics TF1 → ThemeKey (quand typology est absente ou générique)
 const TF1_TOPICS_MAP: Record<string, ThemeKey> = {
+  // ── Téléréalité (priorité sur les autres dans le context Émission) ─────────
   'téléréalité': 'telerealite',
   'docu-réalité': 'telerealite',
-  'aventure': 'telerealite',  // Koh-Lanta, Survivor…
   'survie': 'telerealite',
-  'danse': 'culture',
-  'chanson': 'culture',
   'mariage': 'telerealite',
   'famille': 'telerealite',
+  'lifestyle': 'telerealite',       // Familles nombreuses
+  // NB : 'aventure' n'est PAS ici — quand typology=Film+topics=Aventure → films
+  //      mais quand typology=Émission+topics=Aventure → résolu par la logique spéciale
+
+  // ── Culture / Divertissement ──────────────────────────────────────────────
+  'danse': 'culture',
+  'chanson': 'culture',
   'divertissement': 'culture',
   'musique': 'culture',
   'concert': 'culture',
+  'spectacle': 'culture',
+  'quiz': 'culture',
+  'humour': 'culture',
+  'culture': 'culture',
+  'talk show': 'culture',
+
+  // ── Sport ─────────────────────────────────────────────────────────────────
   'sport': 'sport',
   'football': 'sport',
+  'cyclisme': 'sport',
+  'rugby': 'sport',
+  'athletisme': 'sport',
+  'docu-réalité sportive': 'sport',
+
+  // ── Info ──────────────────────────────────────────────────────────────────
   'actualité': 'info',
   'journal télévisé': 'info',
-  'reportages': 'info',
+  'faits divers': 'info',
+  'societe': 'info',
+
+  // ── Documentaire ─────────────────────────────────────────────────────────
+  'reportages': 'documentaire',
   'enquête': 'documentaire',
+  'nature': 'documentaire',
+  'histoire': 'documentaire',
+
+  // ── Thriller ─────────────────────────────────────────────────────────────
   'policier': 'thriller',
-  'action': 'films',
   'thriller': 'thriller',
+  'suspense': 'thriller',
+  'crime': 'thriller',
+
+  // ── Films (quand topic d'un Film) ─────────────────────────────────────────
+  'action': 'films',
+  'aventure': 'films',
   'drame': 'films',
   'comédie': 'films',
   'romance': 'films',
@@ -180,12 +211,46 @@ function resolveTheme(
   durationSec: number | undefined,
   llmCache: Record<string, ThemeKey>,
 ): ThemeKey {
-  // 1. Typology directe (TF1 "Film", "Sport", "Information"…)
+  // Typologies "génériques" TF1 qui ne doivent PAS court-circuiter
+  // le check des topics (Émission peut être téléréalité, culture, etc.)
+  const GENERIC_TYPOLOGIES = new Set(['emission', 'spectacle']);
+
+  // 1. Topics en PREMIER pour les typologies génériques TF1
+  //    → ex: Émission + topics["Téléréalité","Mariage"] → telerealite
+  //         Émission + topics["Aventure","Action"] → telerealite (Koh-Lanta)
+  //         Émission + topics["Divertissement","Danse"] → culture
+  //    (pour Film, Sport, Information : typology précise → traitement normal au step 2)
+  const TELEREALITE_TOPICS = new Set([
+    'telerealite', 'docu-realite', 'mariage', 'famille', 'lifestyle',
+    'survie', 'aventure',   // Koh-Lanta, Survivor, etc.
+  ]);
+
+  if (typology && GENERIC_TYPOLOGIES.has(normalizeLabel(typology)) && topics?.length) {
+    // D'abord vérifier les topics téléréalité (priorité absolue)
+    for (const topic of topics) {
+      const t = normalizeLabel(topic);
+      if (TELEREALITE_TOPICS.has(t)) return 'telerealite';
+    }
+    // Ensuite les autres topics
+    for (const topic of topics) {
+      const t = normalizeLabel(topic);
+      if (TF1_TOPICS_MAP[t] && TF1_TOPICS_MAP[t] !== 'films') return TF1_TOPICS_MAP[t];
+      if (CATEGORY_MAP[t] && CATEGORY_MAP[t] !== 'culture' && CATEGORY_MAP[t] !== 'films') return CATEGORY_MAP[t];
+    }
+    // Si que des topics "films" ou "culture", retomber sur culture pour une Émission
+    for (const topic of topics) {
+      const t = normalizeLabel(topic);
+      if (TF1_TOPICS_MAP[t]) return TF1_TOPICS_MAP[t];
+    }
+    // Fallback: Émission générique → culture
+    return 'culture';
+  }
+
+  // 2. Typology précise (Film, Sport, Information…)
   if (typology) {
     const typKey = normalizeLabel(typology);
     const typMapped = CATEGORY_MAP[typKey];
     if (typMapped) {
-      // Heuristique durée : drame/comédie >80min → film
       const isDramaOrComedy = ['drame', 'comedie', 'comedie dramatique'].includes(typKey);
       if (isDramaOrComedy && durationSec !== undefined) {
         return durationSec > 4800 ? 'films' : 'series';
@@ -194,30 +259,29 @@ function resolveTheme(
     }
   }
 
-  // 2. CategoryLabel exact puis fuzzy
+  // 3. CategoryLabel exact puis fuzzy
   if (categoryLabel) {
     const key = normalizeLabel(categoryLabel);
-    const mapped = CATEGORY_MAP[key];
-    if (mapped) {
-      const isDramaOrComedy = ['drame', 'comedie', 'comedie dramatique'].includes(key);
-      if (isDramaOrComedy && durationSec !== undefined) {
-        return durationSec > 4800 ? 'films' : 'series';
+    if (key && !GENERIC_TYPOLOGIES.has(key)) {
+      const mapped = CATEGORY_MAP[key];
+      if (mapped) {
+        const isDramaOrComedy = ['drame', 'comedie', 'comedie dramatique'].includes(key);
+        if (isDramaOrComedy && durationSec !== undefined) {
+          return durationSec > 4800 ? 'films' : 'series';
+        }
+        return mapped;
       }
-      return mapped;
+      for (const [frag, theme] of Object.entries(CATEGORY_MAP)) {
+        if (key.startsWith(frag)) return theme;
+      }
+      for (const [frag, theme] of Object.entries(CATEGORY_MAP)) {
+        if (frag.length >= 6 && key.includes(frag)) return theme;
+      }
+      if (llmCache[key]) return llmCache[key];
     }
-    // Fuzzy startsWith
-    for (const [frag, theme] of Object.entries(CATEGORY_MAP)) {
-      if (key.startsWith(frag)) return theme;
-    }
-    // Fuzzy contains (fragments ≥6 chars)
-    for (const [frag, theme] of Object.entries(CATEGORY_MAP)) {
-      if (frag.length >= 6 && key.includes(frag)) return theme;
-    }
-    // Cache AI
-    if (llmCache[key]) return llmCache[key];
   }
 
-  // 3. Topics TF1 (premier topic qui matche)
+  // 4. Topics (cas général : pas de typology générique traitée avant)
   if (topics?.length) {
     for (const topic of topics) {
       const t = normalizeLabel(topic);
@@ -226,11 +290,33 @@ function resolveTheme(
     }
   }
 
-  // 4. Fallback
+  // 5. Fallback
   return 'series';
 }
 
 // ─── Workers AI (appelé uniquement pour les labels inconnus résiduels) ────────
+
+// Dictionnaire de secours local pour les labels fréquemment inconnus
+// Évite d'appeler l'AI pour des cas déjà vus
+const LOCAL_FALLBACK_MAP: Record<string, ThemeKey> = {
+  // Labels RTBF fréquents non couverts
+  'conte': 'kids', 'fable': 'kids', 'marionnettes': 'kids',
+  'short': 'films', 'court metrage': 'films',
+  'catchup': 'culture', 'replay': 'culture',
+  'emission sportive': 'sport', 'magazine sportif': 'sport',
+  'actu': 'info', 'flash info': 'info', 'meteo': 'info',
+  'sante': 'documentaire', 'medical': 'documentaire',
+  'cuisine': 'documentaire', 'gastronomie': 'documentaire',
+  'mode': 'culture', 'deco': 'culture',
+  'talkshow': 'culture', 'late show': 'culture',
+  // Labels TF1 fréquents
+  'docu-serie': 'documentaire', 'serie documentaire': 'documentaire',
+  'serie animee': 'kids', 'animation jeunesse': 'kids',
+  'comedie romantique': 'films', 'thriller psychologique': 'thriller',
+  'serie policiere': 'thriller', 'policiere': 'thriller',
+  'aventure sportive': 'sport', 'sport mecanique': 'sport',
+  'magazine people': 'culture', 'emission musicale': 'culture',
+};
 
 async function classifyWithWorkersAI(
   unknownLabels: string[],
@@ -238,6 +324,31 @@ async function classifyWithWorkersAI(
 ): Promise<Record<string, ThemeKey>> {
   if (unknownLabels.length === 0) return {};
 
+  // 1. Essayer de résoudre localement d'abord
+  const resolved: Record<string, ThemeKey> = {};
+  const stillUnknown: string[] = [];
+
+  for (const label of unknownLabels) {
+    const k = normalizeLabel(label);
+    if (LOCAL_FALLBACK_MAP[k]) {
+      resolved[k] = LOCAL_FALLBACK_MAP[k];
+    } else {
+      // Fuzzy sur le fallback map
+      let found: ThemeKey | null = null;
+      for (const [frag, theme] of Object.entries(LOCAL_FALLBACK_MAP)) {
+        if (k.includes(frag) || frag.includes(k)) { found = theme; break; }
+      }
+      if (found) resolved[k] = found;
+      else stillUnknown.push(label);
+    }
+  }
+
+  if (stillUnknown.length === 0) {
+    console.log('[AI] Tous les labels résolus localement:', resolved);
+    return resolved;
+  }
+
+  // 2. Appeler l'AI uniquement pour ce qui reste vraiment inconnu
   const themeKeys = Object.keys(THEMES).join(', ');
   const prompt = `Tu es un classificateur de genres vidéo.
 Pour chaque label ci-dessous, retourne le thème le plus proche parmi : ${themeKeys}.
@@ -245,10 +356,10 @@ Réponds UNIQUEMENT avec un objet JSON valide, sans texte autour.
 Format : { "label": "theme", ... }
 
 Labels :
-${unknownLabels.map(l => `- "${l}"`).join('\n')}`;
+${stillUnknown.map(l => `- "${l}"`).join('\n')}`;
 
   try {
-    console.log('[AI] Classification de', unknownLabels.length, 'labels:', unknownLabels);
+    console.log('[AI] Classification de', stillUnknown.length, 'labels:', stillUnknown);
     const response = await env.AI.run('@cf/meta/llama-3-8b-instruct', {
       messages: [{ role: 'user', content: prompt }],
       max_tokens: 512,
@@ -259,15 +370,16 @@ ${unknownLabels.map(l => `- "${l}"`).join('\n')}`;
     if (!jsonMatch) throw new Error('Réponse AI non parseable');
 
     const result: Record<string, string> = JSON.parse(jsonMatch[0]);
-    const valid: Record<string, ThemeKey> = {};
     for (const [label, theme] of Object.entries(result)) {
-      if (theme in THEMES) valid[normalizeLabel(label)] = theme as ThemeKey;
+      if (theme in THEMES) resolved[normalizeLabel(label)] = theme as ThemeKey;
     }
-    return valid;
   } catch (err) {
-    console.error('[worker] AI classification failed:', err);
-    return {};
+    console.error('[worker] AI classification failed, using series fallback for:', stillUnknown);
+    // En cas d'échec AI : fallback 'series' pour tout le reste
+    for (const label of stillUnknown) resolved[normalizeLabel(label)] = 'series';
   }
+
+  return resolved;
 }
 
 // ─── Fetch RTBF ───────────────────────────────────────────────────────────────
@@ -460,7 +572,6 @@ function deduplicate(items: NormalizedItem[]): NormalizedItem[] {
 function buildBuckets(
   rtbfItems: NormalizedItem[],
   tf1Items: NormalizedItem[],
-  maxPerBucket = 40,
 ): ThematicBucket[] {
   // Regrouper par thème séparément
   const rtbfGroups = new Map<ThemeKey, NormalizedItem[]>();
@@ -484,13 +595,14 @@ function buildBuckets(
       const rtbf = rtbfGroups.get(theme) ?? [];
       const tf1  = tf1Groups.get(theme)  ?? [];
 
-      // Interleave : 1 RTBF, 1 TF1, 1 RTBF, 1 TF1 … jusqu'à maxPerBucket
+      // Interleave : 1 RTBF, 1 TF1, 1 RTBF, 1 TF1 … sans limite
+      // Le frontend scroll horizontalement, pas besoin de couper
       const merged: NormalizedItem[] = [];
       const maxR = rtbf.length, maxT = tf1.length;
       let r = 0, t = 0;
-      while (merged.length < maxPerBucket && (r < maxR || t < maxT)) {
+      while (r < maxR || t < maxT) {
         if (r < maxR) merged.push(rtbf[r++]);
-        if (merged.length < maxPerBucket && t < maxT) merged.push(tf1[t++]);
+        if (t < maxT) merged.push(tf1[t++]);
       }
 
       return {
@@ -741,7 +853,7 @@ export default {
       }
 
       // ── 8. Construire les buckets (interleaved RTBF + TF1) ────────────────
-      const buckets = buildBuckets(rtbfItems, tf1Items, 40);
+      const buckets = buildBuckets(rtbfItems, tf1Items);
 
       // ── 9. Répondre ────────────────────────────────────────────────────────
       console.log(`[worker] rtbf=${rtbfItems.length} tf1=${tf1Items.length} buckets=${buckets.length} ai_calls=${unknownLabels.length}`);
