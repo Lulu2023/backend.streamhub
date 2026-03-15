@@ -16,6 +16,8 @@ export interface Env {
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 type ThemeKey =
+  | 'top'          // ⭐ Top 10 TF1 (TopProgramItem)
+  | 'episodes'     // 🎞️ Épisodes récents RTBF (VIDEO en cours de diffusion)
   | 'thriller'
   | 'films'
   | 'series'
@@ -24,7 +26,7 @@ type ThemeKey =
   | 'info'
   | 'sport'
   | 'kids'
-  | 'telerealite';   // ← nouvelle catégorie pour la téléréalité TF1
+  | 'telerealite';
 
 interface NormalizedItem {
   id: string;
@@ -180,6 +182,8 @@ const TF1_TOPICS_MAP: Record<string, ThemeKey> = {
 };
 
 const THEMES: Record<ThemeKey, { label: string; emoji: string }> = {
+  top:          { label: 'Top TF1+',                emoji: '⭐' },
+  episodes:     { label: 'Épisodes récents',         emoji: '🎞️' },
   thriller:     { label: 'Policier & Thriller',      emoji: '🔍' },
   films:        { label: 'Films',                    emoji: '🎬' },
   series:       { label: 'Séries',                   emoji: '📺' },
@@ -192,9 +196,16 @@ const THEMES: Record<ThemeKey, { label: string; emoji: string }> = {
 };
 
 const BUCKET_ORDER: ThemeKey[] = [
-  'thriller', 'films', 'series', 'telerealite',
+  'top', 'episodes', 'thriller', 'films', 'series', 'telerealite',
   'documentaire', 'culture', 'info', 'sport', 'kids',
 ];
+
+// Buckets qui doivent être affichés en LANDSCAPE (images horizontales)
+// Déterminé par la nature du contenu RTBF dans chaque bucket.
+// Les items TF1 dans ces buckets utiliseront le thumbnail paysage (1280×720).
+const LANDSCAPE_BUCKETS = new Set<ThemeKey>([
+  'episodes', 'thriller', 'documentaire', 'culture', 'info', 'sport',
+]);
 
 // ─── Classification ───────────────────────────────────────────────────────────
 
@@ -451,7 +462,17 @@ async function fetchTF1(): Promise<any> {
 
 function normalizeRTBFItem(item: any, llmCache: Record<string, ThemeKey>): NormalizedItem | null {
   if (!item || item.resourceType === 'LIVE') return null;
-  const theme = resolveTheme(item.categoryLabel, undefined, undefined, item.duration, llmCache);
+
+  const baseTheme = resolveTheme(item.categoryLabel, undefined, undefined, item.duration, llmCache);
+
+  // Les épisodes/vidéos RTBF (type VIDEO, resourceType MEDIA) dans un bucket
+  // thématique "programmes" (series, films, thriller) → bucket dédié 'episodes'
+  // pour ne pas mélanger avec les affiches de programmes (portrait).
+  // Exception : documentaire, culture, sport, info sont déjà landscape → garder le thème.
+  const isEpisode = item.type === 'VIDEO' && item.resourceType === 'MEDIA';
+  const episodeBuckets = new Set<ThemeKey>(['series', 'films', 'thriller', 'telerealite']);
+  const theme: ThemeKey = (isEpisode && episodeBuckets.has(baseTheme)) ? 'episodes' : baseTheme;
+
   return {
     id: `rtbf-${item.id ?? item.assetId}`,
     title: item.title ?? '',
@@ -495,38 +516,38 @@ function normalizeTF1Item(item: any, llmCache: Record<string, ThemeKey>): Normal
   const rawCategory = typology || (item.__typename === 'Video' ? 'Divertissement' : '');
 
   // ── Classification ──────────────────────────────────────────────────────────
-  const theme = resolveTheme(rawCategory || undefined, topics, typology || undefined, duration, llmCache);
+  // TopProgramItem → bucket dédié 'top' (classement TF1)
+  const isTopProgram = item.__typename === 'TopProgramItem';
+  const theme: ThemeKey = isTopProgram
+    ? 'top'
+    : resolveTheme(rawCategory || undefined, topics, typology || undefined, duration, llmCache);
 
   // ── Images ──────────────────────────────────────────────────────────────────
-  // Règle identique à l'ancien tf1plusAPI (createIllustrationFromSources) :
+  // Règle : le ratio de l'image TF1 suit le bucket de destination.
   //
-  //   ProgramItem / TopProgramItem  →  portrait 217×289 en PRIORITÉ
-  //     → toutes les clés xs/s/m/l/xl = portrait URL
-  //     → VideoCard détecte /217/289/ → aspect-[2/3] → carte VERTICALE ✓
+  //  Bucket portrait  (films, series, top, telerealite…)
+  //    → portrait 217×289  → VideoCard détecte /217/289/ → aspect-[2/3] ✓
   //
-  //   Video (épisode)               →  thumbnail paysage 1280×720 en PRIORITÉ
-  //     → toutes les clés xs/s/m/l/xl = landscape URL
-  //     → VideoCard détecte /1280/720/ → aspect-video → carte HORIZONTALE ✓
-
-  const isProgram = item.__typename === 'ProgramItem' || item.__typename === 'TopProgramItem';
+  //  Bucket landscape (episodes, thriller, documentaire, culture, info, sport)
+  //    → thumbnail 1280×720 → VideoCard détecte /1280/720/ → aspect-video ✓
 
   const portraitUrl =
     pickBestUrl(prog.decoration?.portrait?.sourcesWithScales) ??
     pickBestUrl(item.decoration?.portrait?.sourcesWithScales) ??
-    pickBestUrl(item.thumbnail?.sourcesWithScales);    // item.thumbnail = portrait pour ProgramItem
+    pickBestUrl(item.thumbnail?.sourcesWithScales);
 
   const landscapeUrl =
     pickBestUrl(prog.decoration?.thumbnail?.sourcesWithScales) ??
     pickBestUrl(item.decoration?.thumbnail?.sourcesWithScales) ??
     pickBestUrl(item.image?.sourcesWithScales);
 
-  // Pour les programmes → portrait partout (même m/l/xl) pour forcer la carte verticale
-  // Pour les vidéos/épisodes → paysage partout pour forcer la carte horizontale
-  const primaryUrl   = isProgram ? (portraitUrl ?? landscapeUrl) : (landscapeUrl ?? portraitUrl);
-  const secondaryUrl = isProgram ? landscapeUrl : portraitUrl;
+  // Choix du ratio selon le bucket de destination
+  const useLandscape = LANDSCAPE_BUCKETS.has(theme);
+  const primaryUrl = useLandscape
+    ? (landscapeUrl ?? portraitUrl)   // bucket landscape → paysage en priorité
+    : (portraitUrl  ?? landscapeUrl); // bucket portrait  → portrait en priorité
 
-  // Toutes les clés = primaryUrl pour que VideoCard et getBucketRatio détectent
-  // le bon ratio depuis n'importe quelle clé d'illustration (xs, s, m, l, xl).
+  // Toutes les clés = primaryUrl → VideoCard détecte le bon ratio uniformément
   const illustration: Record<string, string> = {};
   if (primaryUrl) {
     illustration.xs = primaryUrl;
