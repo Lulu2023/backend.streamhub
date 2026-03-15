@@ -460,18 +460,21 @@ async function fetchTF1(): Promise<any> {
 
 // ─── Normalisation RTBF ───────────────────────────────────────────────────────
 
-function normalizeRTBFItem(item: any, llmCache: Record<string, ThemeKey>): NormalizedItem | null {
+function normalizeRTBFItem(item: any, llmCache: Record<string, ThemeKey>, widgetTitle = ''): NormalizedItem | null {
   if (!item || item.resourceType === 'LIVE') return null;
 
-  const baseTheme = resolveTheme(item.categoryLabel, undefined, undefined, item.duration, llmCache);
+  // Si le widget source s'appelle "Kids" → forcer le thème kids
+  // (les items PROGRAM_LIST Kids n'ont pas de categoryLabel)
+  const widgetTitleLow = widgetTitle.toLowerCase();
+  const isKidsWidget = widgetTitleLow.includes('kids') || widgetTitleLow.includes('enfant') || widgetTitleLow.includes('jeunesse');
 
-  // Les épisodes/vidéos RTBF (type VIDEO, resourceType MEDIA) dans un bucket
-  // thématique "programmes" (series, films, thriller) → bucket dédié 'episodes'
-  // pour ne pas mélanger avec les affiches de programmes (portrait).
-  // Exception : documentaire, culture, sport, info sont déjà landscape → garder le thème.
+  const baseTheme = isKidsWidget
+    ? 'kids'
+    : resolveTheme(item.categoryLabel, undefined, undefined, item.duration, llmCache);
+
   const isEpisode = item.type === 'VIDEO' && item.resourceType === 'MEDIA';
-  const episodeBuckets = new Set<ThemeKey>(['series', 'films', 'thriller', 'telerealite']);
-  const theme: ThemeKey = (isEpisode && episodeBuckets.has(baseTheme)) ? 'episodes' : baseTheme;
+  const episodeBuckets = new Set(['series', 'films', 'thriller', 'telerealite']);
+  const theme = (isEpisode && episodeBuckets.has(baseTheme)) ? 'episodes' : baseTheme;
 
   return {
     id: `rtbf-${item.id ?? item.assetId}`,
@@ -561,6 +564,23 @@ function normalizeTF1Item(item: any, llmCache: Record<string, ThemeKey>): Normal
   const isFilm       = typology === 'Film';
   const resourceType = (isVideo || isFilm) ? 'MEDIA' : 'PROGRAM';
 
+  // ── Badges & métadonnées ────────────────────────────────────────────────────
+  // VideoCard attend : stamp, hasSubtitles, hasAudioDescriptions, rating, publishedTo
+  const hasSubtitles       = (prog.hasFrenchDeafSubtitles?.total ?? 0) > 0
+                           || (prog.hasFrenchSubtitles?.total ?? 0) > 0;
+  const hasAudioDescriptions = (prog.hasDescriptionTrack?.total ?? 0) > 0;
+
+  let rating: string | null = prog.rating ?? item.rating ?? null;
+  if (rating) rating = rating.replace('CSA_', '').replace('ALL', 'Tout public');
+
+  // Stamp depuis badges TF1 (ex: "Nouvel épisode", "Avant-première"…)
+  const allBadges = [...(item.badges ?? []), ...(item.editorBadges ?? [])];
+  const stamp = allBadges.length > 0 ? {
+    label:           allBadges[0].label ?? allBadges[0].type ?? '',
+    backgroundColor: '#1a56db',
+    textColor:       '#fff',
+  } : undefined;
+
   const enrichedRaw = {
     ...item,
     id,
@@ -577,6 +597,11 @@ function normalizeTF1Item(item: any, llmCache: Record<string, ThemeKey>): Normal
     platform: 'TF1+',
     streamId: isVideo ? id : undefined,
     assetId:  isVideo ? id : undefined,
+    // Badges et métadonnées visibles dans VideoCard
+    hasSubtitles,
+    hasAudioDescriptions,
+    rating,
+    stamp,
     ...(isFilm ? { isFilm: true } : {}),
   };
 
@@ -663,35 +688,45 @@ function buildRTBFBanners(rtbfHome: any): any[] {
   const banners: any[] = [];
   const allWidgets = rtbfHome?.data?.widgets ?? [];
   for (const w of allWidgets) {
-    if (w.type !== 'BANNER' || !w.data) continue;
-    const d = w.data;
-    const dl: string = d.deepLink ?? '';
+    // RTBF utilise type=PROMOBOX (pas BANNER) avec data.content[]
+    if (w.type !== 'PROMOBOX' || !w.data?.content) continue;
 
-    let contentType: string | null = null;
-    let contentId: string | null = null;
-    let contentSlug: string | null = null;
+    for (const d of (w.data.content as any[])) {
+      const dl: string = d.deeplink ?? '';
 
-    const emMatch   = dl.match(/^\/emission\/(.+)-(\d+)$/);
-    const medMatch  = dl.match(/^\/media\/(.+)-(\d+)$/);
-    const progMatch = dl.match(/^\/program(?:me)?\/(.+)-(\d+)$/);
-    if (emMatch)        { contentType = 'emission'; contentId = emMatch[2];  contentSlug = emMatch[1] + '-' + emMatch[2]; }
-    else if (medMatch)  { contentType = 'media';    contentId = medMatch[2]; contentSlug = medMatch[1] + '-' + medMatch[2]; }
-    else if (progMatch) { contentType = 'program';  contentId = progMatch[2]; contentSlug = progMatch[1] + '-' + progMatch[2]; }
+      // Résoudre contentType + contentId depuis le deeplink ou resourceType
+      let contentType: string = d.resourceType ?? 'media'; // 'media' ou 'program'
+      let contentId:   string = String(d.resourceValue ?? '');
+      let contentSlug: string | null = null;
 
-    banners.push({
-      id: `rtbf-banner-${d.id ?? w.id ?? Math.random()}`,
-      coverId: String(d.id ?? ''),
-      title: d.title ?? '',
-      description: d.description ?? '',
-      image: d.image ?? null,
-      videoUrl: d.videoUrl ?? null,
-      deepLink: dl || null,
-      contentType, contentId, contentSlug,
-      textPosition: d.textPosition ?? 'left',
-      theme: d.theme ?? 'dark',
-      backgroundColor: d.backgroundColor ?? '#000000',
-      platform: 'RTBF',
-    });
+      // Extraire le slug depuis le deeplink
+      // /media/titre-du-film-3446888  →  contentType=media,  id=3446888
+      // /emission/nom-emission-31432  →  contentType=program, id=31432
+      const medMatch  = dl.match(/^\/media\/(.+)-(\d+)$/);
+      const emMatch   = dl.match(/^\/emission\/(.+)-(\d+)$/);
+      const progMatch = dl.match(/^\/program(?:me)?\/(.+)-(\d+)$/);
+      if (medMatch)        { contentType = 'media';   contentId = medMatch[2];  contentSlug = medMatch[1]; }
+      else if (emMatch)    { contentType = 'program'; contentId = emMatch[2];   contentSlug = emMatch[1]; }
+      else if (progMatch)  { contentType = 'program'; contentId = progMatch[2]; contentSlug = progMatch[1]; }
+
+      if (!d.title) continue;
+
+      banners.push({
+        id:          `rtbf-banner-${contentId || Math.random()}`,
+        coverId:     contentId,
+        title:       d.title,
+        subtitle:    d.subtitle ?? '',
+        description: d.description ?? '',
+        image:       d.image ?? null,
+        videoUrl:    null,
+        deepLink:    dl || null,
+        contentType,
+        contentId,
+        contentSlug,
+        backgroundColor: d.backgroundColor ?? '#000000',
+        platform: 'RTBF',
+      });
+    }
   }
   return banners;
 }
@@ -826,20 +861,31 @@ export default {
       // ── 4. Normaliser items RTBF ───────────────────────────────────────────
       let rtbfItems: NormalizedItem[] = [];
       if (rtbfHome) {
+        // EXCLUDED : widgets qui n'ont pas d'items à afficher comme cartes
+        // PROMOBOX → géré par buildRTBFBanners (banners hero)
+        // BANNER   → plus utilisé par RTBF (remplacé par PROMOBOX)
         const EXCLUDED = new Set([
           'FAVORITE_PROGRAM_LIST', 'CHANNEL_LIST', 'ONGOING_PLAY_HISTORY',
-          'CATEGORY_LIST', 'PROMOBOX', 'BANNER', 'MEDIA_TRAILER',
+          'CATEGORY_LIST', 'BANNER', 'MEDIA_TRAILER',
+          // PROMOBOX intentionnellement absent : ses items sont dans les banners
         ]);
         const widgets = rtbfHome.data?.widgets ?? [];
-        const fetches = widgets
+
+        // Construire les fetches avec le titre du widget (pour Kids detection)
+        const widgetMetas = widgets
           .filter((w: any) => !EXCLUDED.has(w.type) && w.contentPath)
-          .map((w: any) => fetchRTBFWidget(w.contentPath));
+          .map((w: any) => ({ title: w.title ?? '', fetch: fetchRTBFWidget(w.contentPath) }));
+
+        const fetches     = widgetMetas.map((m: any) => m.fetch);
+        const widgetTitles = widgetMetas.map((m: any) => m.title);
 
         const results = await Promise.allSettled(fetches);
-        for (const r of results) {
+        for (let i = 0; i < results.length; i++) {
+          const r = results[i];
           if (r.status !== 'fulfilled') continue;
+          const widgetTitle = widgetTitles[i] ?? '';
           for (const raw of r.value) {
-            const item = normalizeRTBFItem(raw, llmCache);
+            const item = normalizeRTBFItem(raw, llmCache, widgetTitle);
             if (item) rtbfItems.push(item);
           }
         }
