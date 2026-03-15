@@ -688,49 +688,60 @@ function buildBuckets(
 
 // ─── Banners helpers ──────────────────────────────────────────────────────────
 
-function buildRTBFBanners(rtbfHome: any): any[] {
+function buildRTBFBanners(rtbfHome: any, promoboxItems: any[] = []): any[] {
   const banners: any[] = [];
-  const allWidgets = rtbfHome?.data?.widgets ?? [];
-  for (const w of allWidgets) {
-    // RTBF utilise type=PROMOBOX (pas BANNER) avec data.content[]
-    if (w.type !== 'PROMOBOX' || !w.data?.content) continue;
 
-    for (const d of (w.data.content as any[])) {
-      const dl: string = d.deeplink ?? '';
-
-      // Résoudre contentType + contentId depuis le deeplink ou resourceType
-      let contentType: string = d.resourceType ?? 'media'; // 'media' ou 'program'
-      let contentId:   string = String(d.resourceValue ?? '');
-      let contentSlug: string | null = null;
-
-      // Extraire le slug depuis le deeplink
-      // /media/titre-du-film-3446888  →  contentType=media,  id=3446888
-      // /emission/nom-emission-31432  →  contentType=program, id=31432
-      const medMatch  = dl.match(/^\/media\/(.+)-(\d+)$/);
-      const emMatch   = dl.match(/^\/emission\/(.+)-(\d+)$/);
-      const progMatch = dl.match(/^\/program(?:me)?\/(.+)-(\d+)$/);
-      if (medMatch)        { contentType = 'media';   contentId = medMatch[2];  contentSlug = medMatch[1]; }
-      else if (emMatch)    { contentType = 'program'; contentId = emMatch[2];   contentSlug = emMatch[1]; }
-      else if (progMatch)  { contentType = 'program'; contentId = progMatch[2]; contentSlug = progMatch[1]; }
-
-      if (!d.title) continue;
-
-      banners.push({
-        id:          `rtbf-banner-${contentId || Math.random()}`,
-        coverId:     contentId,
-        title:       d.title,
-        subtitle:    d.subtitle ?? '',
-        description: d.description ?? '',
-        image:       d.image ?? null,
-        videoUrl:    null,
-        deepLink:    dl || null,
-        contentType,
-        contentId,
-        contentSlug,
-        backgroundColor: d.backgroundColor ?? '#000000',
-        platform: 'RTBF',
-      });
+  // Priorité aux items pré-fetchés, sinon tenter w.data?.content (rarement présent)
+  const items = promoboxItems.length > 0 ? promoboxItems : (() => {
+    const allWidgets = rtbfHome?.data?.widgets ?? [];
+    for (const w of allWidgets) {
+      if (w.type === 'PROMOBOX' && Array.isArray(w.data?.content)) return w.data.content as any[];
     }
+    return [] as any[];
+  })();
+
+  for (const d of items) {
+    const dl: string = d.deeplink ?? '';
+
+    let contentType: string = d.resourceType ?? 'media';
+    let contentId:   string = String(d.resourceValue ?? d.mediaId ?? '');
+    let contentSlug: string | null = null;
+
+    const medMatch  = dl.match(/^\/media\/(.+)-(\d+)$/);
+    const emMatch   = dl.match(/^\/emission\/(.+)-(\d+)$/);
+    const progMatch = dl.match(/^\/program(?:me)?\/(.+)-(\d+)$/);
+    if (medMatch)        { contentType = 'media';   contentId = medMatch[2];  contentSlug = medMatch[1]; }
+    else if (emMatch)    { contentType = 'program'; contentId = emMatch[2];   contentSlug = emMatch[1]; }
+    else if (progMatch)  { contentType = 'program'; contentId = progMatch[2]; contentSlug = progMatch[1]; }
+
+    if (!d.title) continue;
+
+    // L'API RTBF retourne image: { xs, s, m, l, xl } directement (URLs absolues)
+    const image = d.image
+      ? {
+          xs: d.image.xs ?? d.image.s ?? '',
+          s:  d.image.s  ?? '',
+          m:  d.image.m  ?? '',
+          l:  d.image.l  ?? '',
+          xl: d.image.xl ?? d.image.l ?? '',
+        }
+      : null;
+
+    banners.push({
+      id:          `rtbf-banner-${contentId || Math.random()}`,
+      coverId:     contentId,
+      title:       d.title,
+      subtitle:    d.subtitle ?? '',
+      description: d.description ?? '',
+      image,
+      videoUrl:    null,
+      deepLink:    dl || null,
+      contentType,
+      contentId,
+      contentSlug,
+      backgroundColor: d.backgroundColor ?? '#000000',
+      platform: 'RTBF',
+    });
   }
   return banners;
 }
@@ -740,48 +751,100 @@ function buildTF1Banners(tf1Raw: any): any[] {
   const covers: any[] = tf1Raw?._tf1Banners ?? [];
 
   for (const cover of covers.slice(0, 6)) {
-    const prog  = cover.program ?? {};
-    const id    = cover.id ?? prog.id;
-    const title = cover.title ?? prog.decoration?.label ?? prog.name ?? '';
+    // Structure réelle : cover.decoration contient label, description, cover, video
+    // cover.program contient id, slug, typology, topics, etc.
+    // cover.video (CoverOfVideo) contient id, slug, season, episode, playingInfos.duration
+    const deco = cover.decoration ?? {};
+    const prog = cover.program ?? {};
+    // Pour CoverOfVideo, récupérer les infos depuis cover.video
+    const vid  = cover.video  ?? {};
+
+    const id    = cover.id ?? prog.id ?? vid.id;
+    const title = deco.label ?? prog.name ?? vid.program?.name ?? '';
     if (!id || !title) continue;
 
-    const desc = cover.description ?? prog.decoration?.catchPhrase ?? prog.decoration?.description ?? '';
+    const desc = deco.description ?? deco.catchPhrase ?? deco.summary ?? '';
 
-    const bgSrc   = [...(cover.image?.sourcesWithScales ?? [])].sort((a: any, b: any) => (b.scale ?? 0) - (a.scale ?? 0));
-    const portSrc = [...(prog.decoration?.portrait?.sourcesWithScales ?? [])].sort((a: any, b: any) => (b.scale ?? 0) - (a.scale ?? 0));
-    const bgUrl   = bgSrc[0]?.url ?? '';
-    const portUrl = portSrc[0]?.url ?? '';
+    // ── Image ────────────────────────────────────────────────────────────────
+    // decoration.cover → image paysage (640×360 base, scale 2x/3x disponible)
+    // decoration.coverSmall → portrait (430×660)
+    // On préfère cover (paysage) pour xl/l/m et coverSmall pour xs/s
+    const bgSrcs   = [...(deco.cover?.sourcesWithScales ?? [])].sort((a: any, b: any) => (b.scale ?? 1) - (a.scale ?? 1));
+    const portSrcs = [...(deco.coverSmall?.sourcesWithScales ?? [])].sort((a: any, b: any) => (b.scale ?? 1) - (a.scale ?? 1));
 
-    const image = (bgUrl || portUrl) ? {
-      xs: portUrl || bgUrl, s: portUrl || bgUrl,
-      m:  bgUrl || portUrl, l: bgUrl || portUrl, xl: bgUrl || portUrl,
+    // Choisir la meilleure URL selon la résolution disponible
+    const bgBest   = bgSrcs.find((s: any) => s.scale >= 2)?.url ?? bgSrcs[0]?.url ?? '';
+    const bgBase   = bgSrcs[0]?.url ?? '';
+    const portBest = portSrcs.find((s: any) => s.scale >= 2)?.url ?? portSrcs[0]?.url ?? '';
+    const portBase = portSrcs[0]?.url ?? '';
+
+    const image = (bgBest || portBest) ? {
+      xs: portBase || bgBase,
+      s:  portBest || bgBase,
+      m:  bgBase   || portBase,
+      l:  bgBest   || portBest,
+      xl: bgBest   || portBest,
     } : null;
 
-    let contentType = 'program';
-    if (cover.__typename === 'Video' || cover.contentType === 'VIDEO') contentType = 'video';
-    else if (cover.contentType === 'LIVE') contentType = 'live';
+    // ── Vidéo bande-annonce ───────────────────────────────────────────────────
+    // decoration.video.sources[0].url
+    const videoUrl = deco.video?.sources?.[0]?.url ?? null;
 
-    const contentId   = cover.contentId   ?? (contentType === 'video' ? id : prog.id ?? id);
-    const contentSlug = cover.contentSlug ?? (contentType === 'video' ? cover.slug : prog.slug);
-    const programId   = prog.id ?? null;
-    const programSlug = prog.slug ?? null;
+    // ── ContentType / IDs ─────────────────────────────────────────────────────
+    // CoverOfProgram → contentType=program, id=prog.id, slug=prog.slug
+    //                  Le 1er CTA WatchButtonAction donne l'id de la vidéo à jouer
+    // CoverOfVideo   → contentType=video ou media, id=vid.id, slug=vid.slug
+    const typename = cover.__typename ?? '';
+    let contentType: string;
+    let contentId:   string;
+    let contentSlug: string | null;
+    let programId:   string | null = prog.id ?? null;
+    let programSlug: string | null = prog.slug ?? null;
+
+    if (typename === 'CoverOfVideo' || cover.contentType === 'VIDEO') {
+      contentType  = 'video';
+      contentId    = vid.id ?? id;
+      contentSlug  = vid.slug ?? cover.contentSlug ?? null;
+      // programId/programSlug déjà assignés depuis prog
+    } else {
+      // CoverOfProgram ou fallback
+      contentType = 'program';
+      // Le 1er CTA de type PLAY donne la vidéo à jouer
+      const ctaPlay = cover.callToAction?.items?.find((i: any) => i.type === 'PLAY' || i.__typename === 'WatchButtonAction');
+      contentId    = ctaPlay?.video?.id ?? ctaPlay?.id ?? prog.id ?? id;
+      contentSlug  = ctaPlay?.video?.slug ?? prog.slug ?? cover.contentSlug ?? null;
+    }
+
+    // ── Métadonnées ───────────────────────────────────────────────────────────
+    // Priorité : CoverOfVideo.video > CoverOfProgram.callToAction.video
+    const ctaVideo = cover.callToAction?.items?.find((i: any) => i.video)?.video ?? {};
+    const season   = vid.season   ?? ctaVideo?.season   ?? null;
+    const episode  = vid.episode  ?? ctaVideo?.episode  ?? null;
+    const duration = vid.playingInfos?.duration ?? ctaVideo?.playingInfos?.duration ?? null;
+    const rights   = vid.rights   ?? ctaVideo?.rights   ?? cover.rights ?? [];
+
+    // Topics depuis le programme associé (CoverOfVideo: vid.program, CoverOfProgram: prog)
+    const topicsSource = (typename === 'CoverOfVideo' ? vid.program : prog) ?? prog;
 
     banners.push({
       id: `tf1-banner-${id}`,
       coverId: String(id),
-      title, description: desc, image,
-      videoUrl: cover.videoUrl ?? null,
+      title,
+      description: desc,
+      image,
+      videoUrl,
       deepLink: null,
       contentType,
-      contentId:   contentId ?? id,
+      contentId:   String(contentId ?? id),
       contentSlug: contentSlug ?? null,
-      programId, programSlug,
-      typology:  prog.typology ?? cover.typology ?? '',
-      topics:    prog.topics ?? [],
-      season:    cover.season   ?? prog.season   ?? null,
-      episode:   cover.episode  ?? prog.episode  ?? null,
-      duration:  cover.duration ?? prog.duration ?? null,
-      rights:    cover.rights   ?? [],
+      programId,
+      programSlug,
+      typology:  topicsSource.typology  ?? prog.typology  ?? '',
+      topics:    topicsSource.topics    ?? prog.topics    ?? [],
+      season,
+      episode,
+      duration,
+      rights,
       backgroundColor: '#000000',
       platform: 'TF1+',
     });
@@ -853,9 +916,29 @@ export default {
       if (tf1Result.status  === 'rejected') console.error('[worker] TF1 fetch error:',  tf1Result.reason);
 
       // ── 2. Banners hero ────────────────────────────────────────────────────
+      // Pour RTBF, le PROMOBOX doit être fetché séparément (widget contentPath)
+      let rtbfPromoItems: any[] = [];
+      if (rtbfHome) {
+        const promoWidget = (rtbfHome.data?.widgets ?? []).find((w: any) => w.type === 'PROMOBOX');
+        if (promoWidget?.contentPath) {
+          try {
+            const pUrl = promoWidget.contentPath.startsWith('http')
+              ? promoWidget.contentPath
+              : `https://bff-service.rtbf.be${promoWidget.contentPath}`;
+            const pRes = await fetch(pUrl, { headers: { Accept: 'application/json' } });
+            if (pRes.ok) {
+              const pJson: any = await pRes.json();
+              rtbfPromoItems = pJson?.data?.content ?? pJson?.data ?? [];
+            }
+          } catch (e) {
+            console.error('[worker] RTBF PROMOBOX fetch error:', e);
+          }
+        }
+      }
+
       const heroBanners: any[] = [
-        ...(rtbfHome ? buildRTBFBanners(rtbfHome) : []),
-        ...(tf1Raw   ? buildTF1Banners(tf1Raw)    : []),
+        ...(rtbfHome ? buildRTBFBanners(rtbfHome, rtbfPromoItems) : []),
+        ...(tf1Raw   ? buildTF1Banners(tf1Raw)                    : []),
       ];
 
       // ── 3. Lire le cache LLM une seule fois ────────────────────────────────
@@ -871,7 +954,7 @@ export default {
         const EXCLUDED = new Set([
           'FAVORITE_PROGRAM_LIST', 'CHANNEL_LIST', 'ONGOING_PLAY_HISTORY',
           'CATEGORY_LIST', 'BANNER', 'MEDIA_TRAILER',
-          // PROMOBOX intentionnellement absent : ses items sont dans les banners
+          'PROMOBOX', // Géré séparément dans buildRTBFBanners
         ]);
         const widgets = rtbfHome.data?.widgets ?? [];
 
