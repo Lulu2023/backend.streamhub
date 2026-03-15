@@ -271,6 +271,272 @@ async function fetchTF1(): Promise<any> {
     ...(homeJson ?? {}),
     _tf1Banners: bannersJson?.data?.homeCoversByRight ?? [],
   };
+}gler
+ *   wrangler login
+ *   wrangler deploy
+ *
+ * Une seule requête depuis le téléphone :
+ *   GET /home  →  { buckets: ThematicBucket[] }
+ *
+ * Le Worker fait les requêtes RTBF + TF1 en parallèle côté serveur,
+ * classifie les labels inconnus via Cloudflare Workers AI (gratuit),
+ * et renvoie des buckets prêts.
+ *
+ * Bindings à ajouter dans le dashboard Cloudflare (Workers & Pages → ton worker → Settings) :
+ *   - KV Namespace : LABEL_CACHE  (créer via Storage & Databases → KV)
+ *   - Workers AI   : AI           (activer via AI → Workers AI → Enable)
+ */
+
+export interface Env {
+  // Workers AI — binding natif Cloudflare, gratuit jusqu'à 10 000 req/jour
+  AI: Ai;
+  // KV namespace pour le cache des labels classifiés
+  LABEL_CACHE: KVNamespace;
+}
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+type ThemeKey = 'thriller' | 'films' | 'documentaire' | 'culture' | 'info' | 'kids' | 'sport' | 'series';
+
+interface NormalizedItem {
+  id: string;
+  title: string;
+  subtitle?: string;
+  description?: string;
+  illustration?: Record<string, string>;
+  duration?: number;
+  categoryLabel?: string;
+  platform: 'RTBF' | 'TF1+';
+  channelLabel?: string;
+  resourceType?: string;
+  path?: string;
+  rating?: string | null;
+  theme: ThemeKey;
+  _raw: any;
+}
+
+interface ThematicBucket {
+  theme: ThemeKey;
+  label: string;
+  emoji: string;
+  items: NormalizedItem[];
+}
+
+// ─── Constantes ───────────────────────────────────────────────────────────────
+
+const CATEGORY_MAP: Record<string, ThemeKey> = {
+  // ── Policier / Thriller ──────────────────────────────────────────────────
+  'policier': 'thriller', 'affaires criminelles': 'thriller', 'crime': 'thriller',
+  'thriller': 'thriller', 'serie policiere': 'thriller', 'série policière': 'thriller',
+  'police': 'thriller', 'suspense': 'thriller', 'horreur': 'thriller',
+  'espionnage': 'thriller',
+
+  // ── Films ────────────────────────────────────────────────────────────────
+  // NB : "drame" et "comédie dramatique" sont traités via heuristique durée
+  'film': 'films', 'films': 'films',
+  'comédie': 'films', 'comedie': 'films',
+  'comédie dramatique': 'films', 'comedie dramatique': 'films',
+  'action': 'films', 'aventure': 'films',
+  'science-fiction': 'films', 'sf': 'films', 'fantastique': 'films',
+  'animation': 'films', 'romance': 'films', 'western': 'films',
+  'biopic': 'films', 'téléfilm': 'films', 'telefilm': 'films',
+  'drame': 'films', 'cinema': 'films',
+
+  // ── Documentaire ─────────────────────────────────────────────────────────
+  'documentaire': 'documentaire', 'investigation': 'documentaire',
+  'société': 'documentaire', 'societe': 'documentaire',
+  'histoire': 'documentaire', 'découvertes': 'documentaire', 'decouvertes': 'documentaire',
+  'reportage': 'documentaire', 'nature': 'documentaire', 'science': 'documentaire',
+  'environnement': 'documentaire', 'voyage': 'documentaire',
+  'monde': 'documentaire',
+
+  // ── Culture & Divertissement ──────────────────────────────────────────────
+  'culture': 'culture', 'divertissement': 'culture', 'humour': 'culture',
+  'musique': 'culture', 'talk show': 'culture', 'variétés': 'culture',
+  'varietes': 'culture', 'magazine': 'culture', 'lifestyle': 'culture',
+  'spectacle': 'culture', 'concert': 'culture',
+  'people & musique': 'culture', 'people': 'culture',
+  'litterature': 'culture', 'littérature': 'culture',
+  'jeux': 'culture',  // jeux TV (Billets doux, Génies en herbe) = divertissement adulte
+  'jeux & divertissements': 'culture',
+  'émission': 'culture', 'emission': 'culture',  // émission TV générique
+
+  // ── Info & Actualités ─────────────────────────────────────────────────────
+  'info': 'info', 'actualité': 'info', 'actualités': 'info', 'journal': 'info',
+  'politique': 'info', 'économie': 'info', 'economie': 'info',
+  'news': 'info', 'débat': 'info', 'debat': 'info',
+  'information': 'info',  // typology TF1
+
+  // ── Kids ──────────────────────────────────────────────────────────────────
+  'kids': 'kids', 'enfants': 'kids', 'jeunesse': 'kids',
+  'animé': 'kids', 'anime': 'kids', 'dessin animé': 'kids',
+
+  // ── Sport ─────────────────────────────────────────────────────────────────
+  'sport': 'sport', 'football': 'sport', 'cyclisme': 'sport', 'tennis': 'sport',
+  'rugby': 'sport', 'formule 1': 'sport', 'athlétisme': 'sport',
+  'moteurs': 'sport', 'basket': 'sport', 'natation': 'sport',
+
+  // ── Séries (fallback) ─────────────────────────────────────────────────────
+  'serie': 'series', 'série': 'series', 'sitcom': 'series', 'feuilleton': 'series',
+  'mini serie': 'series', 'mini série': 'series',
+};
+
+const THEMES: Record<ThemeKey, { label: string; emoji: string }> = {
+  thriller:     { label: 'Policier & Thriller',      emoji: '🔍' },
+  films:        { label: 'Films',                    emoji: '🎬' },
+  documentaire: { label: 'Documentaires',            emoji: '📽️' },
+  culture:      { label: 'Culture & Divertissement', emoji: '🎭' },
+  info:         { label: 'Info & Actualités',        emoji: '📰' },
+  series:       { label: 'Séries',                   emoji: '📺' },
+  kids:         { label: 'Kids',                     emoji: '🌟' },
+  sport:        { label: 'Sport',                    emoji: '⚽' },
+};
+
+const BUCKET_ORDER: ThemeKey[] = ['thriller', 'films', 'series', 'documentaire', 'culture', 'info', 'sport', 'kids'];
+
+// ─── Classification ───────────────────────────────────────────────────────────
+
+function resolveThemeSync(categoryLabel: string | undefined, durationSec: number | undefined, llmCache: Record<string, ThemeKey>): ThemeKey {
+  if (!categoryLabel) return 'series';
+  const key = categoryLabel.toLowerCase().trim();
+
+  // 1. Lookup exact
+  const mapped = CATEGORY_MAP[key];
+  if (mapped) {
+    // Heuristique durée : drame/comédie >80min → film, sinon série
+    const isDramaOrComedy = ['drame', 'comédie', 'comedie', 'comédie dramatique', 'comedie dramatique'].includes(key);
+    if (isDramaOrComedy && durationSec !== undefined) {
+      return durationSec > 4800 ? 'films' : 'series';
+    }
+    return mapped;
+  }
+
+  // 2. Fuzzy : le label COMMENCE PAR un fragment connu (évite les faux positifs)
+  //    Ex : "comédie dramatique" commence par "comédie" ✓
+  //    Mais "spectacle" ne commence pas par "sport" ✓ (pas de faux positif)
+  for (const [fragment, theme] of Object.entries(CATEGORY_MAP)) {
+    if (key.startsWith(fragment)) return theme;
+  }
+
+  // 3. Fuzzy élargi : contient le fragment (seulement pour les fragments longs ≥6 chars)
+  for (const [fragment, theme] of Object.entries(CATEGORY_MAP)) {
+    if (fragment.length >= 6 && key.includes(fragment)) return theme;
+  }
+
+  // 4. Cache AI
+  if (llmCache[key]) return llmCache[key];
+
+  // 5. Fallback — ce label sera envoyé à Workers AI
+  return 'series';
+}
+
+/**
+ * Envoie les labels inconnus à Ollama en un seul appel.
+ * Retourne un map label → ThemeKey.
+ */
+async function classifyWithWorkersAI(
+  unknownLabels: string[],
+  env: Env,
+): Promise<Record<string, ThemeKey>> {
+  if (unknownLabels.length === 0) return {};
+
+  const themeKeys = Object.keys(THEMES).join(', ');
+  const prompt = `Tu es un classificateur de genres vidéo.
+Pour chaque label ci-dessous, retourne le thème le plus proche parmi : ${themeKeys}.
+Réponds UNIQUEMENT avec un objet JSON valide, sans texte autour.
+Format : { "label": "theme", ... }
+
+Labels :
+${unknownLabels.map(l => `- "${l}"`).join('\n')}`;
+
+  try {
+    // Workers AI — Llama 3 8B, gratuit jusqu'à 10 000 req/jour
+    console.log('[AI] Classification de', unknownLabels.length, 'labels:', unknownLabels);
+    const response = await env.AI.run('@cf/meta/llama-3-8b-instruct', {
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: 512,
+    });
+
+    const text = (response as any).response ?? '';
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error('Réponse Workers AI non parseable');
+
+    const result: Record<string, string> = JSON.parse(jsonMatch[0]);
+    const valid: Record<string, ThemeKey> = {};
+
+    for (const [label, theme] of Object.entries(result)) {
+      if (Object.keys(THEMES).includes(theme)) {
+        valid[label.toLowerCase().trim()] = theme as ThemeKey;
+      }
+    }
+
+    return valid;
+  } catch (err) {
+    console.error('[worker] Workers AI classification failed:', err);
+    return {};
+  }
+}
+
+// ─── Fetch plateformes ────────────────────────────────────────────────────────
+
+async function fetchRTBF(): Promise<any> {
+  const url = 'https://bff-service.rtbf.be/auvio/v1.23/pages/home?userAgent=Chrome-web-3.0';
+  const res = await fetch(url, { headers: { 'Accept': 'application/json' } });
+  if (!res.ok) throw new Error(`RTBF ${res.status}`);
+  return res.json();
+}
+
+async function fetchRTBFWidget(contentPath: string): Promise<any[]> {
+  try {
+    const url = contentPath.startsWith('http') ? contentPath : `https://bff-service.rtbf.be${contentPath}`;
+    const res = await fetch(`${url}${url.includes('?') ? '&' : '?'}_limit=20&_embed=content`, {
+      headers: { 'Accept': 'application/json' },
+    });
+    if (!res.ok) return [];
+    const json = await res.json();
+    return json?.data?.content ?? json?.data ?? [];
+  } catch {
+    return [];
+  }
+}
+
+async function fetchTF1(): Promise<any> {
+  const headers = {
+    'content-type': 'application/json',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    'Origin': 'https://www.tf1.fr',
+    'Referer': 'https://www.tf1.fr/',
+  };
+
+  // Requête homepage complète (tous types de contenus + banners LARGE/MEDIUM)
+  const homeParams = encodeURIComponent(JSON.stringify({
+    ofBannerTypes: ['LARGE', 'MEDIUM'],
+    ofContentTypes: [
+      'ARTICLE', 'CATEGORY', 'CHANNEL', 'COLLECTION', 'EXTERNAL_LINK', 'LANDING_PAGE',
+      'LIVE', 'NEXT_BROADCAST', 'PERSONALITY', 'PLAYLIST', 'PLUGIN', 'PROGRAM',
+      'PROGRAM_BY_CATEGORY', 'SMART_SUMMARY', 'TOP_PROGRAM', 'TOP_VIDEO', 'TRAILER', 'VIDEO',
+    ],
+    ofChannelTypes: ['CORNER', 'DIGITAL', 'EVENT', 'PARTNER', 'TV'],
+  }));
+
+  // Requête banners cover (homeCoversByRight)
+  const BANNER_ID = 'bd8e6aab9996844dad4ea9a53887adad27d86151';
+  const HOME_ID   = 'c34093152db844db6b7ad9b56df12841f7d13182';
+
+  const [homeRes, bannersRes] = await Promise.allSettled([
+    fetch(`https://www.tf1.fr/graphql/fr-be/web?id=${HOME_ID}&variables=${homeParams}`, { method: 'GET', headers }),
+    fetch(`https://www.tf1.fr/graphql/web?id=${BANNER_ID}`, { method: 'GET', headers }),
+  ]);
+
+  const homeJson    = homeRes.status === 'fulfilled' && homeRes.value.ok
+    ? await homeRes.value.json() : null;
+  const bannersJson = bannersRes.status === 'fulfilled' && bannersRes.value.ok
+    ? await bannersRes.value.json() : null;
+
+  return {
+    ...(homeJson ?? {}),
+    _tf1Banners: bannersJson?.data?.homeCoversByRight ?? [],
+  };
 }
 
 // ─── Normalisation ────────────────────────────────────────────────────────────
@@ -299,44 +565,87 @@ function normalizeRTBFItem(item: any, llmCache: Record<string, ThemeKey>): Norma
 function normalizeTF1Item(item: any, llmCache: Record<string, ThemeKey>): NormalizedItem | null {
   if (!item) return null;
 
-  const isFilm = item.typology === 'Film' || item.__typename === 'Video' && item.genre === 'Film';
+  const prog = item.program ?? item;
+  const isFilm = (prog.typology ?? item.typology) === 'Film';
   const rawCategory =
-    item.typology
+    prog.typology
+    ?? item.typology
+    ?? prog.genre
     ?? item.genre
-    ?? item.program?.typology
-    ?? item.program?.genre
     ?? (isFilm ? 'Film' : undefined)
     ?? (item.__typename === 'Video' ? 'Divertissement' : 'Série');
 
-  const theme = resolveThemeSync(rawCategory, item.duration, llmCache);
+  const theme = resolveThemeSync(rawCategory, item.duration ?? prog.duration, llmCache);
 
-  // Image
-  const sourcesWithScales =
-    item.image?.sourcesWithScales
-    ?? item.decoration?.portrait?.sourcesWithScales
-    ?? item.program?.decoration?.portrait?.sourcesWithScales
-    ?? [];
-  const bestUrl = sourcesWithScales.sort((a: any, b: any) => (b.scale ?? 0) - (a.scale ?? 0))[0]?.url;
-  const illustration = bestUrl ? { xs: bestUrl, s: bestUrl, m: bestUrl, l: bestUrl, xl: bestUrl } : undefined;
-
-  const id = item.id ?? item.program?.id;
-  const title = item.decoration?.label ?? item.title ?? item.program?.decoration?.label ?? '';
+  const id = prog.id ?? item.id;
+  const title = prog.decoration?.label ?? prog.name ?? item.decoration?.label ?? item.name ?? '';
   if (!title || !id) return null;
+
+  // ── Images ─────────────────────────────────────────────────────────────────
+  // Priorité 1 : thumbnail paysage (16/9)
+  const thumbnailSources: any[] =
+    prog.decoration?.thumbnail?.sourcesWithScales
+    ?? item.decoration?.thumbnail?.sourcesWithScales
+    ?? [];
+  // Priorité 2 : image générique de l'item
+  const itemImageSources: any[] = item.image?.sourcesWithScales ?? [];
+  // Priorité 3 : portrait (fallback)
+  const portraitSources: any[] =
+    prog.decoration?.portrait?.sourcesWithScales
+    ?? item.decoration?.portrait?.sourcesWithScales
+    ?? [];
+
+  const pickBest = (sources: any[]) =>
+    [...sources].sort((a: any, b: any) => (b.scale ?? 0) - (a.scale ?? 0))[0]?.url as string | undefined;
+
+  const landscapeUrl = pickBest(thumbnailSources) ?? pickBest(itemImageSources);
+  const portraitUrl  = pickBest(portraitSources);
+
+  // On stocke les deux dans illustration : m/l/xl = paysage, xs/s = portrait
+  // VideoCard détectera le ratio via l'URL
+  const illustration: Record<string, string> = {};
+  if (portraitUrl)  { illustration.xs = portraitUrl; illustration.s = portraitUrl; }
+  if (landscapeUrl) { illustration.m  = landscapeUrl; illustration.l = landscapeUrl; illustration.xl = landscapeUrl; }
+  else if (portraitUrl) { illustration.m = portraitUrl; illustration.l = portraitUrl; illustration.xl = portraitUrl; }
+
+  const isVideo = item.__typename === 'Video';
+  const resourceType = isVideo ? 'MEDIA' : 'PROGRAM';
+
+  // Enrichissement de _raw avec les champs normalisés pour que VideoCard fonctionne
+  const enrichedRaw = {
+    ...item,
+    // Champs directs que VideoCard lit
+    id,
+    title,
+    subtitle: item.decoration?.catchPhrase ?? prog.decoration?.catchPhrase ?? prog.decoration?.description,
+    description: prog.synopsis ?? prog.decoration?.description ?? item.synopsis,
+    illustration: Object.keys(illustration).length > 0 ? illustration : undefined,
+    duration: item.duration ?? prog.duration ?? 0,
+    typology: prog.typology ?? item.typology ?? rawCategory,
+    slug: prog.slug ?? item.slug,
+    programId: prog.id,
+    programSlug: prog.slug,
+    resourceType,
+    platform: 'TF1+',
+    // Champs spécifiques TF1 que VideoCard utilise pour les liens
+    streamId: isVideo ? id : undefined,
+    assetId: isVideo ? id : undefined,
+  };
 
   return {
     id: `tf1-${id}`,
     title,
-    subtitle: item.decoration?.catchPhrase ?? item.program?.decoration?.catchPhrase,
-    description: item.synopsis ?? item.program?.synopsis ?? item.program?.decoration?.description,
-    illustration,
-    duration: item.duration ?? 0,
+    subtitle: enrichedRaw.subtitle,
+    description: enrichedRaw.description,
+    illustration: Object.keys(illustration).length > 0 ? illustration : undefined,
+    duration: enrichedRaw.duration,
     categoryLabel: rawCategory,
     platform: 'TF1+',
     channelLabel: 'TF1+',
-    resourceType: item.__typename === 'Video' ? 'MEDIA' : 'PROGRAM',
-    path: `/tf1/${item.__typename === 'Video' ? 'video' : 'program'}/${id}`,
+    resourceType,
+    path: `/tf1/${isVideo ? 'video' : 'program'}/${id}`,
     theme,
-    _raw: item,
+    _raw: enrichedRaw,
   };
 }
 
@@ -399,170 +708,113 @@ export default {
         fetchTF1(),
       ]);
 
-      // 2. Banners RTBF — chaque widget BANNER doit être fetché individuellement.
-      //    La home retourne seulement { type, id, contentPath } ; le détail
-      //    (title, description, image, deepLink, backgroundColor) est dans la réponse du widget.
+      // 2. Extraire les banners RTBF + highlights TF1 (hero carousel)
       const heroBanners: any[] = [];
+
+      // ── Banners RTBF ────────────────────────────────────────────────────────
       if (rtbfHome.status === 'fulfilled') {
-        const bannerWidgets = (rtbfHome.value?.data?.widgets ?? [])
-          .filter((w: any) => w.type === 'BANNER' && w.contentPath);
+        const allWidgets = rtbfHome.value?.data?.widgets ?? [];
+        for (const w of allWidgets) {
+          if (w.type !== 'BANNER' || !w.data) continue;
+          const d = w.data;
 
-        const bannerResults = await Promise.allSettled(
-          bannerWidgets.map((w: any) =>
-            fetch(w.contentPath, { headers: { Accept: 'application/json' } })
-              .then((r: Response) => r.ok ? r.json() : null)
-          )
-        );
-
-        for (const res of bannerResults) {
-          if (res.status !== 'fulfilled' || !res.value) continue;
-          const d = res.value?.data;
-          if (!d?.title) continue;
-
-          // Extraire le slug et l'ID numérique depuis deepLink, ex: /emission/the-gold-le-casse-du-siecle-31394
-          const deepLink: string | null = d.deepLink ?? null;
+          // Extraire contentType + contentId depuis le deepLink RTBF
+          // Ex: /emission/the-gold-31394 → emission, 31394
+          //     /media/some-title-3446819 → media, 3446819
+          let contentType: string | null = null;
+          let contentId: string | null = null;
           let contentSlug: string | null = null;
-          let contentId: string | null   = null;
-          let contentType: 'emission' | 'media' | 'other' | null = null;
-          if (deepLink) {
-            const m = deepLink.match(/^\/(emission|media)\/([^/]+?)(?:-(\d+))?$/);
-            if (m) {
-              contentType = m[1] as 'emission' | 'media';
-              contentSlug = m[2] + (m[3] ? `-${m[3]}` : '');
-              contentId   = m[3] ?? null;
-            } else {
-              contentType = 'other';
-            }
-          }
+          const dl: string = d.deepLink ?? '';
+          const emMatch  = dl.match(/^\/emission\/(.+)-(\d+)$/);
+          const medMatch = dl.match(/^\/media\/(.+)-(\d+)$/);
+          const progMatch = dl.match(/^\/program(?:me)?\/(.+)-(\d+)$/);
+          if (emMatch)   { contentType = 'emission'; contentId = emMatch[2];  contentSlug = emMatch[1] + '-' + emMatch[2]; }
+          else if (medMatch)  { contentType = 'media';    contentId = medMatch[2]; contentSlug = medMatch[1] + '-' + medMatch[2]; }
+          else if (progMatch) { contentType = 'program';  contentId = progMatch[2]; contentSlug = progMatch[1] + '-' + progMatch[2]; }
 
           heroBanners.push({
-            id:          `rtbf-banner-${d.id ?? Math.random()}`,
-            coverId:     String(d.id ?? ''),
-            title:       d.title,
+            id: `rtbf-banner-${d.id ?? w.id ?? Math.random()}`,
+            coverId: String(d.id ?? ''),
+            title: d.title ?? '',
             description: d.description ?? '',
-            image:       d.image ?? null,
-            videoUrl:    null,               // RTBF banners n'ont pas de trailer
-            deepLink,
-            contentType,                     // 'emission' | 'media' | 'other' | null
-            contentId,                       // ID numérique RTBF (string), ex: "31394"
-            contentSlug,                     // slug complet, ex: "the-gold-le-casse-du-siecle-31394"
+            image: d.image ?? null,
+            videoUrl: d.videoUrl ?? null,
+            deepLink: dl || null,
+            contentType,
+            contentId,
+            contentSlug,
             textPosition: d.textPosition ?? 'left',
-            theme:        d.theme ?? 'dark',
+            theme: d.theme ?? 'dark',
             backgroundColor: d.backgroundColor ?? '#000000',
             platform: 'RTBF',
           });
         }
       }
 
-      // 2b. Banners TF1 — homeCoversByRight
-      //   __typename variants:
-      //     CoverOfLive    → live.{ id, title, channel.slug, program.{ id, slug, name, typology, topics } }
-      //     CoverOfVideo   → video.{ id, slug, type, season, episode, playingInfos.duration, program.{ id, slug, name, typology } }
-      //     CoverOfProgram → program.{ id, slug, name, typology } + callToAction.items[0].video.{ id, slug, season, episode }
+      // ── Banners TF1 ─────────────────────────────────────────────────────────
       if (tf1Raw.status === 'fulfilled') {
         const covers: any[] = tf1Raw.value?._tf1Banners ?? [];
-
-        const pickBest = (sources: any[] = []) =>
-          [...sources].sort((a: any, b: any) => (b.scale ?? 0) - (a.scale ?? 0))[0]?.url;
-
         for (const cover of covers.slice(0, 6)) {
-          const dec       = cover.decoration ?? {};
-          const typename  = cover.__typename ?? '';
+          const prog  = cover.program ?? {};
+          const id    = cover.id ?? prog.id;
+          const title = cover.title ?? prog.decoration?.label ?? prog.name ?? '';
+          const desc  = cover.description ?? prog.decoration?.catchPhrase ?? prog.decoration?.description ?? '';
 
-          // Extraire programme + contenu selon le type
-          const prog      = cover.live?.program ?? cover.video?.program ?? cover.program ?? {};
-          const videoItem = cover.video ?? cover.callToAction?.items?.[0]?.video ?? null;
-          const liveItem  = cover.live ?? null;
+          // Images : on garde les deux sources (xs/s = portrait, m/l/xl = paysage)
+          const bgSources: any[]  = [...(cover.image?.sourcesWithScales ?? [])].sort((a: any, b: any) => (b.scale ?? 0) - (a.scale ?? 0));
+          const portSources: any[] = [...(prog.decoration?.portrait?.sourcesWithScales ?? [])].sort((a: any, b: any) => (b.scale ?? 0) - (a.scale ?? 0));
+          const bgUrl   = bgSources[0]?.url ?? '';
+          const portUrl = portSources[0]?.url ?? '';
 
-          const coverId   = cover.id;
-          const progId    = prog.id ?? null;
-          const progSlug  = prog.slug ?? null;
-          const progName  = prog.name ?? dec.label ?? '';
-          const typology  = prog.typology ?? null;
-          const topics    = prog.topics ?? [];
-
-          // Contenu spécifique selon le type
-          let contentId: string | null   = null;
-          let contentSlug: string | null = null;
-          let contentType: 'live' | 'video' | 'program' = 'program';
-          let season: number | null   = null;
-          let episode: number | null  = null;
-          let duration: number | null = null;
-          let videoRights: string[]   = [];
-
-          if (typename === 'CoverOfLive' && liveItem) {
-            contentId   = liveItem.id ?? null;
-            contentSlug = liveItem.channel?.slug ?? progSlug;
-            contentType = 'live';
-            videoRights = liveItem.rights ?? [];
-          } else if (typename === 'CoverOfVideo' && videoItem) {
-            contentId   = videoItem.id ?? null;
-            contentSlug = videoItem.slug ?? null;
-            contentType = 'video';
-            season      = videoItem.season ?? null;
-            episode     = videoItem.episode ?? null;
-            duration    = videoItem.playingInfos?.duration ?? null;
-            videoRights = videoItem.rights ?? [];
-          } else if (typename === 'CoverOfProgram') {
-            const cta = cover.callToAction?.items?.[0]?.video;
-            contentId   = cta?.id ?? progId;
-            contentSlug = cta?.slug ?? progSlug;
-            contentType = 'program';
-            season      = cta?.season ?? null;
-            episode     = cta?.episode ?? null;
-            duration    = cta?.playingInfos?.duration ?? null;
-            videoRights = cta?.rights ?? [];
-          }
-
-          const title = progName;
-          const desc  = dec.catchPhrase ?? dec.description ?? dec.summary ?? '';
-
-          const imgLandscape = pickBest(dec.cover?.sourcesWithScales);
-          const imgPortrait  = pickBest(dec.coverSmall?.sourcesWithScales);
-          const image = (imgLandscape || imgPortrait) ? {
-            xs:  imgPortrait  ?? imgLandscape,
-            s:   imgPortrait  ?? imgLandscape,
-            m:   imgLandscape ?? imgPortrait,
-            l:   imgLandscape ?? imgPortrait,
-            xl:  imgLandscape ?? imgPortrait,
+          const image = bgUrl || portUrl ? {
+            xs: portUrl || bgUrl,
+            s:  portUrl || bgUrl,
+            m:  bgUrl   || portUrl,
+            l:  bgUrl   || portUrl,
+            xl: bgUrl   || portUrl,
           } : null;
 
-          const videoUrl = dec.video?.sources?.[0]?.url ?? null;
+          // vidéo bande-annonce
+          const videoUrl: string | null = cover.videoUrl ?? null;
 
-          // deepLink : préférer le slug du contenu (video/live) ou du programme
-          const deepLink = contentSlug
-            ? (contentType === 'video'   ? `/tf1/video/${contentSlug}`
-            :  contentType === 'live'    ? `/tf1/live/${contentSlug}`
-            :                              `/tf1/program/${progSlug ?? contentSlug}`)
-            : (progSlug ? `/tf1/program/${progSlug}` : null);
+          // contentType depuis la structure TF1
+          const typology: string = prog.typology ?? cover.typology ?? '';
+          let contentType = 'program';
+          if (cover.__typename === 'Video' || cover.contentType === 'VIDEO') contentType = 'video';
+          else if (cover.contentType === 'LIVE') contentType = 'live';
 
-          if (coverId && title) {
-            heroBanners.push({
-              id:          `tf1-banner-${coverId}`,
-              coverId,
-              title,
-              description: desc,
-              image,
-              videoUrl,            // trailer MP4 (peut être null)
-              deepLink,
-              contentType,         // 'live' | 'video' | 'program'
-              contentId,           // ID de la vidéo/live/programme cible
-              contentSlug,         // slug direct du contenu
-              programId:   progId,
-              programSlug: progSlug,
-              typology,            // 'Émission' | 'Série' | null
-              topics,              // ['Divertissement', 'Chanson', ...]
-              season,
-              episode,
-              duration,            // secondes
-              rights:      videoRights, // ['BASIC', 'MAX', ...]
-              backgroundColor: '#000000',
-              platform: 'TF1+',
-            });
-          }
+          // Contenu lié
+          const contentId    = cover.contentId ?? (contentType === 'video' ? id : prog.id ?? id);
+          const contentSlug  = cover.contentSlug ?? (contentType === 'video' ? cover.slug : prog.slug);
+          const programId    = prog.id ?? (contentType !== 'program' ? prog.id : null);
+          const programSlug  = prog.slug;
+
+          if (!id || !title) continue;
+
+          heroBanners.push({
+            id: `tf1-banner-${id}`,
+            coverId: String(id),
+            title,
+            description: desc,
+            image,
+            videoUrl,
+            deepLink: null,
+            contentType,
+            contentId: contentId ?? id,
+            contentSlug: contentSlug ?? null,
+            programId:   programId ?? null,
+            programSlug: programSlug ?? null,
+            typology,
+            topics: prog.topics ?? [],
+            season:   cover.season   ?? prog.season   ?? null,
+            episode:  cover.episode  ?? prog.episode  ?? null,
+            duration: cover.duration ?? prog.duration ?? null,
+            rights:   cover.rights   ?? [],
+            backgroundColor: '#000000',
+            platform: 'TF1+',
+          });
         }
-
-        // Fallback si homeCoversByRight vide
+        // Fallback si homeCoversByRight vide : premier slider homepage
         if (covers.length === 0) {
           const sliders: any[] = tf1Raw.value?.data?.homeSliders ?? [];
           for (const item of (sliders[0]?.items ?? []).slice(0, 5)) {
@@ -570,32 +822,31 @@ export default {
             const id    = prog.id ?? item.id;
             const title = prog.decoration?.label ?? prog.name ?? '';
             const desc  = prog.decoration?.catchPhrase ?? prog.decoration?.description ?? '';
-            const sources = [
-              ...(prog.decoration?.thumbnail?.sourcesWithScales ?? []),
-              ...(prog.decoration?.portrait?.sourcesWithScales  ?? []),
-              ...(item.image?.sourcesWithScales ?? []),
-            ].sort((a: any, b: any) => (b.scale ?? 0) - (a.scale ?? 0));
-            const bestImg = sources[0]?.url;
+            const thumbSrc = [...(prog.decoration?.thumbnail?.sourcesWithScales ?? [])].sort((a: any, b: any) => (b.scale ?? 0) - (a.scale ?? 0));
+            const portSrc  = [...(prog.decoration?.portrait?.sourcesWithScales  ?? [])].sort((a: any, b: any) => (b.scale ?? 0) - (a.scale ?? 0));
+            const bgUrl  = thumbSrc[0]?.url ?? '';
+            const portUrl = portSrc[0]?.url ?? '';
+            const image = bgUrl || portUrl ? {
+              xs: portUrl || bgUrl, s: portUrl || bgUrl,
+              m: bgUrl || portUrl,  l: bgUrl || portUrl, xl: bgUrl || portUrl,
+            } : null;
             if (id && title) {
               heroBanners.push({
                 id: `tf1-banner-${id}`,
-                coverId: id,
+                coverId: String(id),
                 title,
                 description: desc,
-                image: bestImg ? { xs: bestImg, s: bestImg, m: bestImg, l: bestImg, xl: bestImg } : null,
+                image,
                 videoUrl: null,
-                deepLink: `/tf1/program/${id}`,
+                deepLink: null,
                 contentType: 'program',
                 contentId: id,
-                contentSlug: null,
+                contentSlug: prog.slug ?? null,
                 programId: id,
-                programSlug: null,
-                typology: null,
-                topics: [],
-                season: null,
-                episode: null,
-                duration: null,
-                rights: [],
+                programSlug: prog.slug ?? null,
+                typology: prog.typology ?? '',
+                topics: prog.topics ?? [],
+                season: null, episode: null, duration: null, rights: [],
                 backgroundColor: '#000000',
                 platform: 'TF1+',
               });
@@ -634,43 +885,11 @@ export default {
       const llmCache: Record<string, ThemeKey> = llmCacheRaw ? JSON.parse(llmCacheRaw) : {};
 
       if (tf1Raw.status === 'fulfilled') {
-        // La persisted query retourne data.homeSliders (même structure que transformHomePageData)
         const sliders = tf1Raw.value?.data?.homeSliders ?? [];
         for (const slider of sliders) {
           for (const item of slider.items ?? []) {
-            // Extraire le programme selon le __typename (même logique que transformSliderItem)
-            const prog = item.program ?? item; // TopProgramItem/ProgramItem ont un sous-objet program
-            const id = prog.id ?? item.id;
-            const typology = prog.typology ?? item.typology ?? '';
-            const genre = prog.genre ?? item.genre ?? '';
-            const title = prog.decoration?.label ?? prog.name ?? item.decoration?.label ?? '';
-            if (!title || !id) continue;
-
-            const sourcesWithScales =
-              prog.decoration?.portrait?.sourcesWithScales ??
-              prog.decoration?.image?.sourcesWithScales ??
-              item.image?.sourcesWithScales ?? [];
-            const bestUrl = [...sourcesWithScales].sort((a: any, b: any) => (b.scale ?? 0) - (a.scale ?? 0))[0]?.url;
-            const illustration = bestUrl ? { xs: bestUrl, s: bestUrl, m: bestUrl, l: bestUrl, xl: bestUrl } : undefined;
-
-            const rawCategory = typology || genre || (item.__typename === 'Video' ? 'Divertissement' : 'Série');
-            const theme = resolveThemeSync(rawCategory, item.duration ?? 0, llmCache);
-
-            tf1Items.push({
-              id: `tf1-${id}`,
-              title,
-              subtitle: prog.decoration?.catchPhrase,
-              description: prog.synopsis ?? prog.decoration?.description,
-              illustration,
-              duration: item.duration ?? 0,
-              categoryLabel: rawCategory,
-              platform: 'TF1+',
-              channelLabel: 'TF1+',
-              resourceType: item.__typename === 'Video' ? 'MEDIA' : 'PROGRAM',
-              path: `/tf1/${item.__typename === 'Video' ? 'video' : 'program'}/${id}`,
-              theme,
-              _raw: item,
-            });
+            const normalized = normalizeTF1Item(item, llmCache);
+            if (normalized) tf1Items.push(normalized);
           }
         }
       }
@@ -704,7 +923,7 @@ export default {
       }
 
       // 5. Construire les buckets et répondre
-      const buckets = buildBuckets(allItems);
+      const buckets = buildBuckets(allItems, 30);
 
       return new Response(JSON.stringify({
         buckets,
