@@ -498,22 +498,43 @@ function normalizeTF1Item(item: any, llmCache: Record<string, ThemeKey>): Normal
   const theme = resolveTheme(rawCategory || undefined, topics, typology || undefined, duration, llmCache);
 
   // ── Images ──────────────────────────────────────────────────────────────────
-  // Sources paysage (thumbnail 16/9) — priorité 1
+  // Règle identique à l'ancien tf1plusAPI (createIllustrationFromSources) :
+  //
+  //   ProgramItem / TopProgramItem  →  portrait 217×289 en PRIORITÉ
+  //     → toutes les clés xs/s/m/l/xl = portrait URL
+  //     → VideoCard détecte /217/289/ → aspect-[2/3] → carte VERTICALE ✓
+  //
+  //   Video (épisode)               →  thumbnail paysage 1280×720 en PRIORITÉ
+  //     → toutes les clés xs/s/m/l/xl = landscape URL
+  //     → VideoCard détecte /1280/720/ → aspect-video → carte HORIZONTALE ✓
+
+  const isProgram = item.__typename === 'ProgramItem' || item.__typename === 'TopProgramItem';
+
+  const portraitUrl =
+    pickBestUrl(prog.decoration?.portrait?.sourcesWithScales) ??
+    pickBestUrl(item.decoration?.portrait?.sourcesWithScales) ??
+    pickBestUrl(item.thumbnail?.sourcesWithScales);    // item.thumbnail = portrait pour ProgramItem
+
   const landscapeUrl =
     pickBestUrl(prog.decoration?.thumbnail?.sourcesWithScales) ??
     pickBestUrl(item.decoration?.thumbnail?.sourcesWithScales) ??
     pickBestUrl(item.image?.sourcesWithScales);
 
-  // Sources portrait — priorité 2
-  const portraitUrl =
-    pickBestUrl(prog.decoration?.portrait?.sourcesWithScales) ??
-    pickBestUrl(item.decoration?.portrait?.sourcesWithScales) ??
-    pickBestUrl(item.thumbnail?.sourcesWithScales);
+  // Pour les programmes → portrait partout (même m/l/xl) pour forcer la carte verticale
+  // Pour les vidéos/épisodes → paysage partout pour forcer la carte horizontale
+  const primaryUrl   = isProgram ? (portraitUrl ?? landscapeUrl) : (landscapeUrl ?? portraitUrl);
+  const secondaryUrl = isProgram ? landscapeUrl : portraitUrl;
 
+  // Toutes les clés = primaryUrl pour que VideoCard et getBucketRatio détectent
+  // le bon ratio depuis n'importe quelle clé d'illustration (xs, s, m, l, xl).
   const illustration: Record<string, string> = {};
-  if (portraitUrl)  { illustration.xs = portraitUrl;  illustration.s  = portraitUrl; }
-  if (landscapeUrl) { illustration.m  = landscapeUrl; illustration.l  = landscapeUrl; illustration.xl = landscapeUrl; }
-  else if (portraitUrl) { illustration.m = portraitUrl; illustration.l = portraitUrl; illustration.xl = portraitUrl; }
+  if (primaryUrl) {
+    illustration.xs = primaryUrl;
+    illustration.s  = primaryUrl;
+    illustration.m  = primaryUrl;
+    illustration.l  = primaryUrl;
+    illustration.xl = primaryUrl;
+  }
 
   const isVideo      = item.__typename === 'Video';
   const isFilm       = typology === 'Film';
