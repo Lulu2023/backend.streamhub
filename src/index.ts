@@ -198,8 +198,8 @@ const THEMES: Record<ThemeKey, { label: string; emoji: string }> = {
 };
 
 const BUCKET_ORDER: ThemeKey[] = [
-  'top', 'sooner', 'episodes', 'thriller', 'films', 'series', 'telerealite',
-  'documentaire', 'culture', 'info', 'sport', 'kids',
+  'top', 'episodes', 'thriller', 'films', 'series', 'telerealite',
+  'documentaire', 'culture', 'info', 'sport', 'kids', 'sooner',
 ];
 
 // Buckets qui doivent être affichés en LANDSCAPE (images horizontales)
@@ -568,6 +568,16 @@ function normalizeTF1Item(item: any, llmCache: Record<string, ThemeKey>): Normal
   const isFilm       = typology === 'Film';
   const resourceType = (isVideo || isFilm) ? 'MEDIA' : 'PROGRAM';
 
+  // Pour les films TF1 (CoverOfProgram avec typology=Film), l'ID de la vidéo
+  // est dans le premier CTA WatchButtonAction, pas dans prog.id
+  const ctaVideoId = item.callToAction?.items?.find(
+    (i: any) => i.type === 'PLAY' || i.__typename === 'WatchButtonAction'
+  )?.video?.id ?? null;
+
+  const mediaId  = isVideo ? id : (isFilm ? (ctaVideoId ?? id) : undefined);
+  const streamId = mediaId;
+  const assetId  = mediaId;
+
   // ── Badges & métadonnées ────────────────────────────────────────────────────
   // VideoCard attend : stamp, hasSubtitles, hasAudioDescriptions, rating, publishedTo
   const hasSubtitles       = (prog.hasFrenchDeafSubtitles?.total ?? 0) > 0
@@ -599,8 +609,8 @@ function normalizeTF1Item(item: any, llmCache: Record<string, ThemeKey>): Normal
     programSlug: prog.slug,
     resourceType,
     platform: 'TF1+',
-    streamId: isVideo ? id : undefined,
-    assetId:  isVideo ? id : undefined,
+    streamId,
+    assetId,
     // Badges et métadonnées visibles dans VideoCard
     hasSubtitles,
     hasAudioDescriptions,
@@ -620,7 +630,7 @@ function normalizeTF1Item(item: any, llmCache: Record<string, ThemeKey>): Normal
     platform: 'TF1+',
     channelLabel: prog.mainChannel?.slug ?? 'TF1+',
     resourceType,
-    path: `/tf1/${resourceType === 'MEDIA' ? 'video' : 'program'}/${id}`,
+    path: `/tf1/${resourceType === 'MEDIA' ? 'video' : 'program'}/${mediaId ?? id}`,
     theme,
     _raw: enrichedRaw,
   };
