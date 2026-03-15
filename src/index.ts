@@ -17,6 +17,7 @@ export interface Env {
 
 type ThemeKey =
   | 'top'          // ⭐ Top 10 TF1 (TopProgramItem)
+  | 'sooner'       // 🎬 Sooner — films premium RTBF (MEDIA_PREMIUM_LIST)
   | 'episodes'     // 🎞️ Épisodes récents RTBF (VIDEO en cours de diffusion)
   | 'thriller'
   | 'films'
@@ -183,6 +184,7 @@ const TF1_TOPICS_MAP: Record<string, ThemeKey> = {
 
 const THEMES: Record<ThemeKey, { label: string; emoji: string }> = {
   top:          { label: 'Top TF1+',                emoji: '⭐' },
+  sooner:       { label: 'Sooner',                  emoji: '🎬' },
   episodes:     { label: 'Épisodes récents',         emoji: '🎞️' },
   thriller:     { label: 'Policier & Thriller',      emoji: '🔍' },
   films:        { label: 'Films',                    emoji: '🎬' },
@@ -196,7 +198,7 @@ const THEMES: Record<ThemeKey, { label: string; emoji: string }> = {
 };
 
 const BUCKET_ORDER: ThemeKey[] = [
-  'top', 'episodes', 'thriller', 'films', 'series', 'telerealite',
+  'top', 'sooner', 'episodes', 'thriller', 'films', 'series', 'telerealite',
   'documentaire', 'culture', 'info', 'sport', 'kids',
 ];
 
@@ -466,10 +468,12 @@ function normalizeRTBFItem(item: any, llmCache: Record<string, ThemeKey>, widget
   // Si le widget source s'appelle "Kids" → forcer le thème kids
   // (les items PROGRAM_LIST Kids n'ont pas de categoryLabel)
   const widgetTitleLow = widgetTitle.toLowerCase();
-  const isKidsWidget = widgetTitleLow.includes('kids') || widgetTitleLow.includes('enfant') || widgetTitleLow.includes('jeunesse');
+  const isKidsWidget   = widgetTitleLow.includes('kids') || widgetTitleLow.includes('enfant') || widgetTitleLow.includes('jeunesse');
+  const isSoonerWidget = item.resourceType === 'MEDIA_PREMIUM'
+    || (Array.isArray(item.products) && item.products.some((p: any) => p.label === 'Sooner'));
 
-  const baseTheme = isKidsWidget
-    ? 'kids'
+  const baseTheme = isSoonerWidget ? 'sooner'
+    : isKidsWidget ? 'kids'
     : resolveTheme(item.categoryLabel, undefined, undefined, item.duration, llmCache);
 
   const isEpisode = item.type === 'VIDEO' && item.resourceType === 'MEDIA';
