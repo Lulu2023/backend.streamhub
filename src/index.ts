@@ -1,4 +1,4 @@
-x/**
+/**
  * Cloudflare Worker — Aggregateur multi-plateforme StreamHub
  *
  * GET /home              → { buckets, heroBanners, meta }
@@ -443,7 +443,7 @@ Items :
 ${itemLines}`;
 
     try {
-      const res = await env.AI.run('@cf/meta/llama-3.2-1b-instruct', {
+      const res = await env.AI.run('@cf/meta/llama-3-8b-instruct', {
         messages: [{ role: 'user', content: prompt }],
         max_tokens: 768,
       });
@@ -1300,8 +1300,21 @@ async function handleListRequest(
   const pageItems = merged.slice(start, end);
   const totalPages = Math.ceil(merged.length / PAGE_SIZE);
 
-  // On retire _raw de la réponse (trop lourd, non utilisé côté ListPage)
-  const slim = pageItems.map(({ _raw: _omit, ...rest }) => rest);
+  // On garde _raw (nécessaire pour VideoCard : ids, resourceType, streamId, etc.)
+  // mais on supprime les tableaux sourcesWithScales TF1 qui sont déjà compilés
+  // dans illustration et qui alourdissent inutilement le payload.
+  const HEAVY_KEYS = new Set([
+    'decoration', 'badges', 'editorBadges', 'callToAction',
+    'sliders', 'covers', 'program', '_sliderTitle',
+  ]);
+  const slim = pageItems.map(item => ({
+    ...item,
+    _raw: item._raw
+      ? Object.fromEntries(
+          Object.entries(item._raw).filter(([k]) => !HEAVY_KEYS.has(k))
+        )
+      : undefined,
+  }));
 
   return new Response(JSON.stringify({
     theme, label: THEMES[theme].label, emoji: THEMES[theme].emoji,
