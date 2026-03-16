@@ -357,26 +357,58 @@ function buildGenres(
  *
  * Retourne un Map<normalizedTitle, string[]> pour tous les items traités.
  */
+/**
+ * Extrait le premier objet JSON valide d'une chaîne de texte libre.
+ * Gère les cas où Llama3 entoure sa réponse de texte parasite ou de
+ * backticks markdown, et les cas où le JSON contient des caractères de contrôle.
+ */
+function extractFirstJSON(text: string): Record<string, unknown> | null {
+  // Nettoyer les caractères de contrôle U+0000–U+001F sauf \t \n \r
+  const clean = text.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '');
+
+  // Trouver la première accolade ouvrante et son accolade fermante correspondante
+  const start = clean.indexOf('{');
+  if (start === -1) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+
+  for (let i = start; i < clean.length; i++) {
+    const ch = clean[i];
+    if (escape)          { escape = false; continue; }
+    if (ch === '\\')     { escape = true;  continue; }
+    if (ch === '"')      { inString = !inString; continue; }
+    if (inString)        continue;
+    if (ch === '{')      depth++;
+    else if (ch === '}') { depth--; if (depth === 0) {
+      try { return JSON.parse(clean.slice(start, i + 1)); }
+      catch { return null; }
+    }}
+  }
+  return null;
+}
+
 async function classifyGenresWithAI(
-  items: Array<{ title: string; subtitle?: string; description?: string }>,
+  items: Array<{ id: string; title: string; subtitle?: string; description?: string }>,
   env: Env,
 ): Promise<Map<string, string[]>> {
+  // Retourne Map<itemId, string[]>
   const result = new Map<string, string[]>();
   if (!items.length) return result;
 
-  // 1. Charger le cache genres KV
+  // 1. Charger le cache genres KV (clé = itemId)
   let genresCache: Record<string, string[]> = {};
   try {
     const raw = await env.LABEL_CACHE.get('genres_map');
     if (raw) genresCache = JSON.parse(raw);
   } catch { /* ignore */ }
 
-  // 2. Séparer ceux déjà en cache de ceux à classifier
+  // 2. Séparer ceux déjà en cache (par ID) de ceux à classifier
   const toClassify: typeof items = [];
   for (const item of items) {
-    const k = normalizeLabel(item.title);
-    if (genresCache[k]) {
-      result.set(k, genresCache[k]);
+    if (genresCache[item.id]) {
+      result.set(item.id, genresCache[item.id]);
     } else {
       toClassify.push(item);
     }
@@ -384,69 +416,63 @@ async function classifyGenresWithAI(
 
   if (!toClassify.length) return result;
 
-  // 3. Classifier par batches de 25 (prompt ~2k tokens, réponse ~1k)
-  const BATCH = 25;
+  // 3. Classifier par batches de 15 (réduit pour limiter la taille de réponse)
+  const BATCH = 15;
   const genreVocab = [...new Set(Object.values(GENRE_MAP))].join(', ');
 
   for (let i = 0; i < toClassify.length; i += BATCH) {
     const batch = toClassify.slice(i, i + BATCH);
 
-    const itemLines = batch.map(item => {
-      const hint = item.subtitle || (item.description?.slice(0, 120) ?? '');
-      return `- "${item.title}"${hint ? ` (${hint})` : ''}`;
+    // On indexe par position pour éviter les ambiguïtés de titre
+    const itemLines = batch.map((item, idx) => {
+      const hint = item.subtitle || (item.description?.slice(0, 80) ?? '');
+      return `${idx}: "${item.title}"${hint ? ` — ${hint}` : ''}`;
     }).join('\n');
 
     const prompt = `Tu es un classificateur de genres pour une plateforme de streaming vidéo francophone.
-Pour chaque film/série/émission ci-dessous, retourne une liste de 1 à 3 genres parmi ce vocabulaire EXACT :
+Pour chaque item ci-dessous (identifié par son index), retourne 1 à 3 genres parmi ce vocabulaire EXACT :
 ${genreVocab}
 
-Règles :
-- Utilise UNIQUEMENT les genres du vocabulaire ci-dessus, mot pour mot
+Règles strictes :
+- Utilise UNIQUEMENT les genres du vocabulaire ci-dessus, mot pour mot, respecte la casse
 - 1 genre minimum, 3 maximum par item
-- Réponds UNIQUEMENT avec un objet JSON valide, sans texte avant ou après
-- Format : { "Titre exact": ["Genre1", "Genre2"] }
+- Réponds UNIQUEMENT avec un objet JSON valide, sans texte avant ni après, sans backticks
+- Format attendu : { "0": ["Genre1"], "1": ["Genre1", "Genre2"], ... }
 
-Items à classifier :
+Items :
 ${itemLines}`;
 
     try {
       const res = await env.AI.run('@cf/meta/llama-3-8b-instruct', {
         messages: [{ role: 'user', content: prompt }],
-        max_tokens: 1024,
+        max_tokens: 768,
       });
 
       const text = (res as any).response ?? '';
-      const match = text.match(/\{[\s\S]*\}/);
-      if (!match) {
-        console.error('[AI genres] Réponse non parseable:', text.slice(0, 200));
+      const parsed = extractFirstJSON(text) as Record<string, string[]> | null;
+
+      if (!parsed) {
+        console.error('[AI genres] Réponse non parseable:', text.slice(0, 300));
         continue;
       }
 
-      const parsed: Record<string, string[]> = JSON.parse(match[0]);
+      let classified = 0;
+      for (const [idxStr, rawGenres] of Object.entries(parsed)) {
+        const idx = parseInt(idxStr, 10);
+        if (isNaN(idx) || idx < 0 || idx >= batch.length) continue;
 
-      for (const [rawTitle, rawGenres] of Object.entries(parsed)) {
-        // Valider que les genres retournés sont dans le vocabulaire
         const validGenres = (Array.isArray(rawGenres) ? rawGenres : [])
           .filter(g => Object.values(GENRE_MAP).includes(g))
           .slice(0, 3);
-
         if (!validGenres.length) continue;
 
-        // Chercher l'item correspondant (match souple sur titre normalisé)
-        const matchedItem = batch.find(it =>
-          normalizeLabel(it.title) === normalizeLabel(rawTitle) ||
-          normalizeLabel(it.title).includes(normalizeLabel(rawTitle)) ||
-          normalizeLabel(rawTitle).includes(normalizeLabel(it.title))
-        );
-
-        if (matchedItem) {
-          const k = normalizeLabel(matchedItem.title);
-          result.set(k, validGenres);
-          genresCache[k] = validGenres;
-        }
+        const item = batch[idx];
+        result.set(item.id, validGenres);
+        genresCache[item.id] = validGenres;
+        classified++;
       }
 
-      console.log(`[AI genres] batch ${Math.floor(i/BATCH)+1}: ${batch.length} items → ${Object.keys(parsed).length} classifiés`);
+      console.log(`[AI genres] batch ${Math.floor(i/BATCH)+1}: ${batch.length} items → ${classified} classifiés`);
     } catch (err) {
       console.error('[AI genres] batch error:', err);
     }
@@ -1235,6 +1261,7 @@ async function handleListRequest(
     console.log(`[/list] AI genre classification: ${needsAI.length} items sans genres`);
 
     const aiInput = needsAI.map(i => ({
+      id:          i.id,
       title:       i.title,
       subtitle:    i.subtitle,
       description: i.description,
@@ -1242,11 +1269,10 @@ async function handleListRequest(
 
     const aiResult = await classifyGenresWithAI(aiInput, env);
 
-    // Appliquer les genres classifiés par l'IA
+    // Appliquer les genres classifiés par l'IA (match par ID)
     for (const item of allItems) {
       if (item.genres.length === 0) {
-        const k = normalizeLabel(item.title);
-        const aiGenres = aiResult.get(k);
+        const aiGenres = aiResult.get(item.id);
         if (aiGenres?.length) item.genres = aiGenres;
       }
     }
@@ -1266,10 +1292,29 @@ async function handleListRequest(
 
   console.log(`[/list] theme=${theme} rtbf=${rtbfItems.length} tf1=${tf1Items.length} total=${merged.length}`);
 
+  // ── Pagination ────────────────────────────────────────────────────────────
+  const PAGE_SIZE = 48;
+  const page  = Math.max(1, parseInt(url.searchParams.get('page') ?? '1', 10));
+  const start = (page - 1) * PAGE_SIZE;
+  const end   = start + PAGE_SIZE;
+  const pageItems = merged.slice(start, end);
+  const totalPages = Math.ceil(merged.length / PAGE_SIZE);
+
+  // On retire _raw de la réponse (trop lourd, non utilisé côté ListPage)
+  const slim = pageItems.map(({ _raw: _omit, ...rest }) => rest);
+
   return new Response(JSON.stringify({
     theme, label: THEMES[theme].label, emoji: THEMES[theme].emoji,
-    items: merged,
-    meta: { rtbf: rtbfItems.length, tf1: tf1Items.length, total: merged.length },
+    items: slim,
+    meta: {
+      rtbf: rtbfItems.length,
+      tf1:  tf1Items.length,
+      total: merged.length,
+      page,
+      pageSize: PAGE_SIZE,
+      totalPages,
+      hasMore: page < totalPages,
+    },
   }), {
     headers: { ...cors, 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=300' },
   });
