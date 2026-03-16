@@ -2,6 +2,7 @@
  * Cloudflare Worker — Aggregateur multi-plateforme StreamHub
  *
  * GET /home → { buckets, heroBanners, meta }
+ * GET /list?theme=<themeKey> → { theme, label, emoji, items, meta }
  *
  * Bindings requis (wrangler.toml) :
  *   [ai]            binding = "AI"
@@ -51,10 +52,10 @@ interface ThematicBucket {
   label: string;
   emoji: string;
   items: NormalizedItem[];
+  hasMore: boolean; // indique si un /list?theme=X est disponible
 }
 
 // ─── Map de classification statique ──────────────────────────────────────────
-// Couvre 100 % des labels RTBF et TF1 observés → quasi 0 appels AI
 
 const CATEGORY_MAP: Record<string, ThemeKey> = {
   // ── Policier / Thriller ──────────────────────────────────────────────────
@@ -90,7 +91,6 @@ const CATEGORY_MAP: Record<string, ThemeKey> = {
   'litterature': 'culture', 'littérature': 'culture',
   'jeux': 'culture', 'jeux & divertissements': 'culture',
   'émission': 'culture', 'emission': 'culture',
-  // TF1 typologies Émission → culture (talk-shows, jeux, etc.)
   'émission de flux': 'culture', 'game show': 'culture', 'quiz': 'culture',
   'talk-show': 'culture', 'variété': 'culture',
 
@@ -98,10 +98,10 @@ const CATEGORY_MAP: Record<string, ThemeKey> = {
   'info': 'info', 'actualité': 'info', 'actualités': 'info', 'journal': 'info',
   'politique': 'info', 'économie': 'info', 'economie': 'info',
   'news': 'info', 'débat': 'info', 'debat': 'info',
-  'information': 'info',   // typology TF1 "Information"
+  'information': 'info',
   'actualite': 'info', 'magazine d\'info': 'info',
 
-  // ── Téléréalité (catégorie dédiée pour TF1) ───────────────────────────────
+  // ── Téléréalité ───────────────────────────────────────────────────────────
   'téléréalité': 'telerealite', 'telerealite': 'telerealite',
   'docu-réalité': 'telerealite', 'docu-realite': 'telerealite',
   'docu-réal': 'telerealite', 'docureality': 'telerealite',
@@ -123,63 +123,19 @@ const CATEGORY_MAP: Record<string, ThemeKey> = {
   'mini serie': 'series', 'mini série': 'series',
 };
 
-// Topics TF1 → ThemeKey (quand typology est absente ou générique)
 const TF1_TOPICS_MAP: Record<string, ThemeKey> = {
-  // ── Téléréalité (priorité sur les autres dans le context Émission) ─────────
-  'téléréalité': 'telerealite',
-  'docu-réalité': 'telerealite',
-  'survie': 'telerealite',
-  'mariage': 'telerealite',
-  'famille': 'telerealite',
-  'lifestyle': 'telerealite',       // Familles nombreuses
-  // NB : 'aventure' n'est PAS ici — quand typology=Film+topics=Aventure → films
-  //      mais quand typology=Émission+topics=Aventure → résolu par la logique spéciale
-
-  // ── Culture / Divertissement ──────────────────────────────────────────────
-  'danse': 'culture',
-  'chanson': 'culture',
-  'divertissement': 'culture',
-  'musique': 'culture',
-  'concert': 'culture',
-  'spectacle': 'culture',
-  'quiz': 'culture',
-  'humour': 'culture',
-  'culture': 'culture',
-  'talk show': 'culture',
-
-  // ── Sport ─────────────────────────────────────────────────────────────────
-  'sport': 'sport',
-  'football': 'sport',
-  'cyclisme': 'sport',
-  'rugby': 'sport',
-  'athletisme': 'sport',
-  'docu-réalité sportive': 'sport',
-
-  // ── Info ──────────────────────────────────────────────────────────────────
-  'actualité': 'info',
-  'journal télévisé': 'info',
-  'faits divers': 'info',
-  'societe': 'info',
-
-  // ── Documentaire ─────────────────────────────────────────────────────────
-  'reportages': 'documentaire',
-  'enquête': 'documentaire',
-  'nature': 'documentaire',
-  'histoire': 'documentaire',
-
-  // ── Thriller ─────────────────────────────────────────────────────────────
-  'policier': 'thriller',
-  'thriller': 'thriller',
-  'suspense': 'thriller',
-  'crime': 'thriller',
-
-  // ── Films (quand topic d'un Film) ─────────────────────────────────────────
-  'action': 'films',
-  'aventure': 'films',
-  'drame': 'films',
-  'comédie': 'films',
-  'romance': 'films',
-  'fantastique': 'films',
+  'téléréalité': 'telerealite', 'docu-réalité': 'telerealite', 'survie': 'telerealite',
+  'mariage': 'telerealite', 'famille': 'telerealite', 'lifestyle': 'telerealite',
+  'danse': 'culture', 'chanson': 'culture', 'divertissement': 'culture',
+  'musique': 'culture', 'concert': 'culture', 'spectacle': 'culture',
+  'quiz': 'culture', 'humour': 'culture', 'culture': 'culture', 'talk show': 'culture',
+  'sport': 'sport', 'football': 'sport', 'cyclisme': 'sport', 'rugby': 'sport',
+  'athletisme': 'sport', 'docu-réalité sportive': 'sport',
+  'actualité': 'info', 'journal télévisé': 'info', 'faits divers': 'info', 'societe': 'info',
+  'reportages': 'documentaire', 'enquête': 'documentaire', 'nature': 'documentaire', 'histoire': 'documentaire',
+  'policier': 'thriller', 'thriller': 'thriller', 'suspense': 'thriller', 'crime': 'thriller',
+  'action': 'films', 'aventure': 'films', 'drame': 'films', 'comédie': 'films',
+  'romance': 'films', 'fantastique': 'films',
 };
 
 const THEMES: Record<ThemeKey, { label: string; emoji: string }> = {
@@ -202,18 +158,61 @@ const BUCKET_ORDER: ThemeKey[] = [
   'documentaire', 'culture', 'info', 'sport', 'kids', 'sooner',
 ];
 
-// Buckets qui doivent être affichés en LANDSCAPE (images horizontales)
-// Déterminé par la nature du contenu RTBF dans chaque bucket.
-// Les items TF1 dans ces buckets utiliseront le thumbnail paysage (1280×720).
 const LANDSCAPE_BUCKETS = new Set<ThemeKey>([
   'episodes', 'thriller', 'documentaire', 'culture', 'info', 'sport',
+]);
+
+// ─── Mappings pour l'endpoint /list ──────────────────────────────────────────
+
+// Chemins des pages catégories RTBF (ex: /categorie/films-36)
+const RTBF_CATEGORY_PATHS: Partial<Record<ThemeKey, string>> = {
+  films:        'films-36',
+  series:       'series-35',
+  documentaire: 'documentaires-31',
+  info:         'info-1',
+  sport:        'sport-9',
+};
+
+// IDs des widgets RTBF pour les thèmes sans page catégorie dédiée
+const RTBF_WIDGET_IDS: Partial<Record<ThemeKey, string>> = {
+  kids:     '22390',
+  sooner:   '19737',
+  culture:  '20136',
+  episodes: '18601', // "Notre sélection" — recent media items
+};
+
+// Titres de widget à forcer pour la détection Kids
+const RTBF_WIDGET_FORCE_TITLES: Partial<Record<ThemeKey, string>> = {
+  kids: 'Kids',
+};
+
+// Slugs des catégories TF1+
+const TF1_CATEGORY_SLUGS: Partial<Record<ThemeKey, string>> = {
+  series:       'series',
+  films:        'films',
+  documentaire: 'reportages',
+  culture:      'divertissement',
+  info:         'info',
+  sport:        'sport',
+  kids:         'jeunesse',
+  telerealite:  'divertissement',
+  thriller:     'series',
+  episodes:     'series',
+};
+
+const TF1_CATEGORY_QUERY_ID = '8cc10401301845f170a0f0a8ae75504f5e586232';
+
+// Thèmes pour lesquels un /list est disponible (bouton "Voir plus" affiché)
+const THEMES_WITH_LIST = new Set<ThemeKey>([
+  'films', 'series', 'documentaire', 'culture', 'info', 'sport',
+  'kids', 'sooner', 'telerealite', 'thriller', 'episodes',
 ]);
 
 // ─── Classification ───────────────────────────────────────────────────────────
 
 function normalizeLabel(s: string): string {
   return s.toLowerCase().trim()
-    .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // strip accents
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
     .replace(/\s+/g, ' ');
 }
 
@@ -224,42 +223,29 @@ function resolveTheme(
   durationSec: number | undefined,
   llmCache: Record<string, ThemeKey>,
 ): ThemeKey {
-  // Typologies "génériques" TF1 qui ne doivent PAS court-circuiter
-  // le check des topics (Émission peut être téléréalité, culture, etc.)
   const GENERIC_TYPOLOGIES = new Set(['emission', 'spectacle']);
 
-  // 1. Topics en PREMIER pour les typologies génériques TF1
-  //    → ex: Émission + topics["Téléréalité","Mariage"] → telerealite
-  //         Émission + topics["Aventure","Action"] → telerealite (Koh-Lanta)
-  //         Émission + topics["Divertissement","Danse"] → culture
-  //    (pour Film, Sport, Information : typology précise → traitement normal au step 2)
   const TELEREALITE_TOPICS = new Set([
-    'telerealite', 'docu-realite', 'mariage', 'famille', 'lifestyle',
-    'survie', 'aventure',   // Koh-Lanta, Survivor, etc.
+    'telerealite', 'docu-realite', 'mariage', 'famille', 'lifestyle', 'survie', 'aventure',
   ]);
 
   if (typology && GENERIC_TYPOLOGIES.has(normalizeLabel(typology)) && topics?.length) {
-    // D'abord vérifier les topics téléréalité (priorité absolue)
     for (const topic of topics) {
       const t = normalizeLabel(topic);
       if (TELEREALITE_TOPICS.has(t)) return 'telerealite';
     }
-    // Ensuite les autres topics
     for (const topic of topics) {
       const t = normalizeLabel(topic);
       if (TF1_TOPICS_MAP[t] && TF1_TOPICS_MAP[t] !== 'films') return TF1_TOPICS_MAP[t];
       if (CATEGORY_MAP[t] && CATEGORY_MAP[t] !== 'culture' && CATEGORY_MAP[t] !== 'films') return CATEGORY_MAP[t];
     }
-    // Si que des topics "films" ou "culture", retomber sur culture pour une Émission
     for (const topic of topics) {
       const t = normalizeLabel(topic);
       if (TF1_TOPICS_MAP[t]) return TF1_TOPICS_MAP[t];
     }
-    // Fallback: Émission générique → culture
     return 'culture';
   }
 
-  // 2. Typology précise (Film, Sport, Information…)
   if (typology) {
     const typKey = normalizeLabel(typology);
     const typMapped = CATEGORY_MAP[typKey];
@@ -272,7 +258,6 @@ function resolveTheme(
     }
   }
 
-  // 3. CategoryLabel exact puis fuzzy
   if (categoryLabel) {
     const key = normalizeLabel(categoryLabel);
     if (key && !GENERIC_TYPOLOGIES.has(key)) {
@@ -294,7 +279,6 @@ function resolveTheme(
     }
   }
 
-  // 4. Topics (cas général : pas de typology générique traitée avant)
   if (topics?.length) {
     for (const topic of topics) {
       const t = normalizeLabel(topic);
@@ -303,16 +287,12 @@ function resolveTheme(
     }
   }
 
-  // 5. Fallback
   return 'series';
 }
 
-// ─── Workers AI (appelé uniquement pour les labels inconnus résiduels) ────────
+// ─── Workers AI ───────────────────────────────────────────────────────────────
 
-// Dictionnaire de secours local pour les labels fréquemment inconnus
-// Évite d'appeler l'AI pour des cas déjà vus
 const LOCAL_FALLBACK_MAP: Record<string, ThemeKey> = {
-  // Labels RTBF fréquents non couverts
   'conte': 'kids', 'fable': 'kids', 'marionnettes': 'kids',
   'short': 'films', 'court metrage': 'films',
   'catchup': 'culture', 'replay': 'culture',
@@ -322,7 +302,6 @@ const LOCAL_FALLBACK_MAP: Record<string, ThemeKey> = {
   'cuisine': 'documentaire', 'gastronomie': 'documentaire',
   'mode': 'culture', 'deco': 'culture',
   'talkshow': 'culture', 'late show': 'culture',
-  // Labels TF1 fréquents
   'docu-serie': 'documentaire', 'serie documentaire': 'documentaire',
   'serie animee': 'kids', 'animation jeunesse': 'kids',
   'comedie romantique': 'films', 'thriller psychologique': 'thriller',
@@ -337,7 +316,6 @@ async function classifyWithWorkersAI(
 ): Promise<Record<string, ThemeKey>> {
   if (unknownLabels.length === 0) return {};
 
-  // 1. Essayer de résoudre localement d'abord
   const resolved: Record<string, ThemeKey> = {};
   const stillUnknown: string[] = [];
 
@@ -346,7 +324,6 @@ async function classifyWithWorkersAI(
     if (LOCAL_FALLBACK_MAP[k]) {
       resolved[k] = LOCAL_FALLBACK_MAP[k];
     } else {
-      // Fuzzy sur le fallback map
       let found: ThemeKey | null = null;
       for (const [frag, theme] of Object.entries(LOCAL_FALLBACK_MAP)) {
         if (k.includes(frag) || frag.includes(k)) { found = theme; break; }
@@ -356,12 +333,8 @@ async function classifyWithWorkersAI(
     }
   }
 
-  if (stillUnknown.length === 0) {
-    console.log('[AI] Tous les labels résolus localement:', resolved);
-    return resolved;
-  }
+  if (stillUnknown.length === 0) return resolved;
 
-  // 2. Appeler l'AI uniquement pour ce qui reste vraiment inconnu
   const themeKeys = Object.keys(THEMES).join(', ');
   const prompt = `Tu es un classificateur de genres vidéo.
 Pour chaque label ci-dessous, retourne le thème le plus proche parmi : ${themeKeys}.
@@ -372,7 +345,6 @@ Labels :
 ${stillUnknown.map(l => `- "${l}"`).join('\n')}`;
 
   try {
-    console.log('[AI] Classification de', stillUnknown.length, 'labels:', stillUnknown);
     const response = await env.AI.run('@cf/meta/llama-3-8b-instruct', {
       messages: [{ role: 'user', content: prompt }],
       max_tokens: 512,
@@ -386,9 +358,7 @@ ${stillUnknown.map(l => `- "${l}"`).join('\n')}`;
     for (const [label, theme] of Object.entries(result)) {
       if (theme in THEMES) resolved[normalizeLabel(label)] = theme as ThemeKey;
     }
-  } catch (err) {
-    console.error('[worker] AI classification failed, using series fallback for:', stillUnknown);
-    // En cas d'échec AI : fallback 'series' pour tout le reste
+  } catch {
     for (const label of stillUnknown) resolved[normalizeLabel(label)] = 'series';
   }
 
@@ -410,7 +380,7 @@ async function fetchRTBFWidget(contentPath: string): Promise<any[]> {
       ? contentPath
       : `https://bff-service.rtbf.be${contentPath}`;
     const res = await fetch(
-      `${url}${url.includes('?') ? '&' : '?'}_limit=24&_embed=content`,
+      `${url}${url.includes('?') ? '&' : '?'}_limit=48&_embed=content`,
       { headers: { Accept: 'application/json' } },
     );
     if (!res.ok) return [];
@@ -419,6 +389,31 @@ async function fetchRTBFWidget(contentPath: string): Promise<any[]> {
   } catch {
     return [];
   }
+}
+
+// Fetch une page catégorie RTBF et retourne tous ses items (tous les widgets combinés)
+async function fetchRTBFCategoryPage(categoryPath: string): Promise<any[]> {
+  const url = `https://bff-service.rtbf.be/auvio/v1.23/pages/categorie/${categoryPath}?userAgent=Chrome-web-3.0`;
+  const res = await fetch(url, { headers: { Accept: 'application/json' } });
+  if (!res.ok) return [];
+  const json: any = await res.json();
+
+  const EXCLUDED = new Set([
+    'FAVORITE_PROGRAM_LIST', 'CHANNEL_LIST', 'ONGOING_PLAY_HISTORY',
+    'CATEGORY_LIST', 'BANNER', 'MEDIA_TRAILER', 'PROMOBOX',
+  ]);
+  const widgets = (json?.data?.widgets ?? []).filter(
+    (w: any) => !EXCLUDED.has(w.type) && w.contentPath,
+  );
+
+  const results = await Promise.allSettled(
+    widgets.map((w: any) => fetchRTBFWidget(w.contentPath)),
+  );
+  const items: any[] = [];
+  for (const r of results) {
+    if (r.status === 'fulfilled') items.push(...r.value);
+  }
+  return items;
 }
 
 // ─── Fetch TF1 ────────────────────────────────────────────────────────────────
@@ -460,13 +455,43 @@ async function fetchTF1(): Promise<any> {
   };
 }
 
+// Fetch une catégorie TF1 par slug (query categoryBySlug)
+async function fetchTF1Category(slug: string): Promise<any[]> {
+  const variables = encodeURIComponent(JSON.stringify({
+    categorySlug: slug,
+    limit: 20,
+    ofContentTypes: [
+      'ARTICLE', 'CATEGORY', 'CHANNEL', 'COLLECTION', 'EXTERNAL_LINK', 'LANDING_PAGE',
+      'LIVE', 'NEXT_BROADCAST', 'PERSONALITY', 'PLAYLIST', 'PLUGIN', 'PROGRAM',
+      'PROGRAM_BY_CATEGORY', 'SMART_SUMMARY', 'TOP_PROGRAM', 'TOP_VIDEO', 'TRAILER', 'VIDEO',
+    ],
+    ofBannerTypes: ['LARGE', 'MEDIUM'],
+    ofChannelTypes: ['CORNER', 'DIGITAL', 'EVENT', 'PARTNER', 'TV'],
+  }));
+
+  const headers = {
+    'content-type': 'application/json',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    'Origin': 'https://www.tf1.fr',
+    'Referer': 'https://www.tf1.fr/',
+  };
+
+  try {
+    const url = `https://www.tf1.fr/graphql/fr-be/web?id=${TF1_CATEGORY_QUERY_ID}&variables=${variables}`;
+    const res = await fetch(url, { method: 'GET', headers });
+    if (!res.ok) return [];
+    const json: any = await res.json();
+    return json?.data?.categoryBySlug?.covers ?? [];
+  } catch {
+    return [];
+  }
+}
+
 // ─── Normalisation RTBF ───────────────────────────────────────────────────────
 
 function normalizeRTBFItem(item: any, llmCache: Record<string, ThemeKey>, widgetTitle = ''): NormalizedItem | null {
   if (!item || item.resourceType === 'LIVE') return null;
 
-  // Si le widget source s'appelle "Kids" → forcer le thème kids
-  // (les items PROGRAM_LIST Kids n'ont pas de categoryLabel)
   const widgetTitleLow = widgetTitle.toLowerCase();
   const isKidsWidget   = widgetTitleLow.includes('kids') || widgetTitleLow.includes('enfant') || widgetTitleLow.includes('jeunesse');
   const isSoonerWidget = item.resourceType === 'MEDIA_PREMIUM'
@@ -512,7 +537,6 @@ function normalizeTF1Item(item: any, llmCache: Record<string, ThemeKey>): Normal
 
   const prog = item.program ?? item;
 
-  // ── Identité ────────────────────────────────────────────────────────────────
   const id    = prog.id ?? item.id;
   const title = prog.decoration?.label ?? prog.name ?? item.decoration?.label ?? item.name ?? item.label ?? '';
   if (!title || !id) return null;
@@ -522,21 +546,10 @@ function normalizeTF1Item(item: any, llmCache: Record<string, ThemeKey>): Normal
   const duration    = item.duration ?? prog.duration ?? 0;
   const rawCategory = typology || (item.__typename === 'Video' ? 'Divertissement' : '');
 
-  // ── Classification ──────────────────────────────────────────────────────────
-  // TopProgramItem → bucket dédié 'top' (classement TF1)
   const isTopProgram = item.__typename === 'TopProgramItem';
   const theme: ThemeKey = isTopProgram
     ? 'top'
     : resolveTheme(rawCategory || undefined, topics, typology || undefined, duration, llmCache);
-
-  // ── Images ──────────────────────────────────────────────────────────────────
-  // Règle : le ratio de l'image TF1 suit le bucket de destination.
-  //
-  //  Bucket portrait  (films, series, top, telerealite…)
-  //    → portrait 217×289  → VideoCard détecte /217/289/ → aspect-[2/3] ✓
-  //
-  //  Bucket landscape (episodes, thriller, documentaire, culture, info, sport)
-  //    → thumbnail 1280×720 → VideoCard détecte /1280/720/ → aspect-video ✓
 
   const portraitUrl =
     pickBestUrl(prog.decoration?.portrait?.sourcesWithScales) ??
@@ -548,13 +561,11 @@ function normalizeTF1Item(item: any, llmCache: Record<string, ThemeKey>): Normal
     pickBestUrl(item.decoration?.thumbnail?.sourcesWithScales) ??
     pickBestUrl(item.image?.sourcesWithScales);
 
-  // Choix du ratio selon le bucket de destination
   const useLandscape = LANDSCAPE_BUCKETS.has(theme);
   const primaryUrl = useLandscape
-    ? (landscapeUrl ?? portraitUrl)   // bucket landscape → paysage en priorité
-    : (portraitUrl  ?? landscapeUrl); // bucket portrait  → portrait en priorité
+    ? (landscapeUrl ?? portraitUrl)
+    : (portraitUrl  ?? landscapeUrl);
 
-  // Toutes les clés = primaryUrl → VideoCard détecte le bon ratio uniformément
   const illustration: Record<string, string> = {};
   if (primaryUrl) {
     illustration.xs = primaryUrl;
@@ -568,8 +579,6 @@ function normalizeTF1Item(item: any, llmCache: Record<string, ThemeKey>): Normal
   const isFilm       = typology === 'Film';
   const resourceType = (isVideo || isFilm) ? 'MEDIA' : 'PROGRAM';
 
-  // Pour les films TF1 (CoverOfProgram avec typology=Film), l'ID de la vidéo
-  // est dans le premier CTA WatchButtonAction, pas dans prog.id
   const ctaVideoId = item.callToAction?.items?.find(
     (i: any) => i.type === 'PLAY' || i.__typename === 'WatchButtonAction'
   )?.video?.id ?? null;
@@ -578,16 +587,13 @@ function normalizeTF1Item(item: any, llmCache: Record<string, ThemeKey>): Normal
   const streamId = mediaId;
   const assetId  = mediaId;
 
-  // ── Badges & métadonnées ────────────────────────────────────────────────────
-  // VideoCard attend : stamp, hasSubtitles, hasAudioDescriptions, rating, publishedTo
-  const hasSubtitles       = (prog.hasFrenchDeafSubtitles?.total ?? 0) > 0
-                           || (prog.hasFrenchSubtitles?.total ?? 0) > 0;
+  const hasSubtitles        = (prog.hasFrenchDeafSubtitles?.total ?? 0) > 0
+                            || (prog.hasFrenchSubtitles?.total ?? 0) > 0;
   const hasAudioDescriptions = (prog.hasDescriptionTrack?.total ?? 0) > 0;
 
   let rating: string | null = prog.rating ?? item.rating ?? null;
   if (rating) rating = rating.replace('CSA_', '').replace('ALL', 'Tout public');
 
-  // Stamp depuis badges TF1 (ex: "Nouvel épisode", "Avant-première"…)
   const allBadges = [...(item.badges ?? []), ...(item.editorBadges ?? [])];
   const stamp = allBadges.length > 0 ? {
     label:           allBadges[0].label ?? allBadges[0].type ?? '',
@@ -611,7 +617,6 @@ function normalizeTF1Item(item: any, llmCache: Record<string, ThemeKey>): Normal
     platform: 'TF1+',
     streamId,
     assetId,
-    // Badges et métadonnées visibles dans VideoCard
     hasSubtitles,
     hasAudioDescriptions,
     rating,
@@ -647,14 +652,12 @@ function deduplicate(items: NormalizedItem[]): NormalizedItem[] {
   return Array.from(seen.values());
 }
 
-// ─── Build buckets : interleave RTBF + TF1 ───────────────────────────────────
-// Pour éviter que RTBF remplisse le bucket avant TF1, on intercale les deux.
+// ─── Build buckets ────────────────────────────────────────────────────────────
 
 function buildBuckets(
   rtbfItems: NormalizedItem[],
   tf1Items: NormalizedItem[],
 ): ThematicBucket[] {
-  // Regrouper par thème séparément
   const rtbfGroups = new Map<ThemeKey, NormalizedItem[]>();
   const tf1Groups  = new Map<ThemeKey, NormalizedItem[]>();
   for (const theme of BUCKET_ORDER) {
@@ -676,8 +679,6 @@ function buildBuckets(
       const rtbf = rtbfGroups.get(theme) ?? [];
       const tf1  = tf1Groups.get(theme)  ?? [];
 
-      // Interleave : 1 RTBF, 1 TF1, 1 RTBF, 1 TF1 … sans limite
-      // Le frontend scroll horizontalement, pas besoin de couper
       const merged: NormalizedItem[] = [];
       const maxR = rtbf.length, maxT = tf1.length;
       let r = 0, t = 0;
@@ -691,6 +692,7 @@ function buildBuckets(
         label: THEMES[theme].label,
         emoji: THEMES[theme].emoji,
         items: merged,
+        hasMore: THEMES_WITH_LIST.has(theme),
       };
     })
     .filter(b => b.items.length > 0);
@@ -701,7 +703,6 @@ function buildBuckets(
 function buildRTBFBanners(rtbfHome: any, promoboxItems: any[] = []): any[] {
   const banners: any[] = [];
 
-  // Priorité aux items pré-fetchés, sinon tenter w.data?.content (rarement présent)
   const items = promoboxItems.length > 0 ? promoboxItems : (() => {
     const allWidgets = rtbfHome?.data?.widgets ?? [];
     for (const w of allWidgets) {
@@ -726,7 +727,6 @@ function buildRTBFBanners(rtbfHome: any, promoboxItems: any[] = []): any[] {
 
     if (!d.title) continue;
 
-    // L'API RTBF retourne image: { xs, s, m, l, xl } directement (URLs absolues)
     const image = d.image
       ? {
           xs: d.image.xs ?? d.image.s ?? '',
@@ -761,12 +761,8 @@ function buildTF1Banners(tf1Raw: any): any[] {
   const covers: any[] = tf1Raw?._tf1Banners ?? [];
 
   for (const cover of covers.slice(0, 6)) {
-    // Structure réelle : cover.decoration contient label, description, cover, video
-    // cover.program contient id, slug, typology, topics, etc.
-    // cover.video (CoverOfVideo) contient id, slug, season, episode, playingInfos.duration
     const deco = cover.decoration ?? {};
     const prog = cover.program ?? {};
-    // Pour CoverOfVideo, récupérer les infos depuis cover.video
     const vid  = cover.video  ?? {};
 
     const id    = cover.id ?? prog.id ?? vid.id;
@@ -775,14 +771,9 @@ function buildTF1Banners(tf1Raw: any): any[] {
 
     const desc = deco.description ?? deco.catchPhrase ?? deco.summary ?? '';
 
-    // ── Image ────────────────────────────────────────────────────────────────
-    // decoration.cover → image paysage (640×360 base, scale 2x/3x disponible)
-    // decoration.coverSmall → portrait (430×660)
-    // On préfère cover (paysage) pour xl/l/m et coverSmall pour xs/s
     const bgSrcs   = [...(deco.cover?.sourcesWithScales ?? [])].sort((a: any, b: any) => (b.scale ?? 1) - (a.scale ?? 1));
     const portSrcs = [...(deco.coverSmall?.sourcesWithScales ?? [])].sort((a: any, b: any) => (b.scale ?? 1) - (a.scale ?? 1));
 
-    // Choisir la meilleure URL selon la résolution disponible
     const bgBest   = bgSrcs.find((s: any) => s.scale >= 2)?.url ?? bgSrcs[0]?.url ?? '';
     const bgBase   = bgSrcs[0]?.url ?? '';
     const portBest = portSrcs.find((s: any) => s.scale >= 2)?.url ?? portSrcs[0]?.url ?? '';
@@ -796,14 +787,8 @@ function buildTF1Banners(tf1Raw: any): any[] {
       xl: bgBest   || portBest,
     } : null;
 
-    // ── Vidéo bande-annonce ───────────────────────────────────────────────────
-    // decoration.video.sources[0].url
     const videoUrl = deco.video?.sources?.[0]?.url ?? null;
 
-    // ── ContentType / IDs ─────────────────────────────────────────────────────
-    // CoverOfProgram → contentType=program, id=prog.id, slug=prog.slug
-    //                  Le 1er CTA WatchButtonAction donne l'id de la vidéo à jouer
-    // CoverOfVideo   → contentType=video ou media, id=vid.id, slug=vid.slug
     const typename = cover.__typename ?? '';
     let contentType: string;
     let contentId:   string;
@@ -815,25 +800,19 @@ function buildTF1Banners(tf1Raw: any): any[] {
       contentType  = 'video';
       contentId    = vid.id ?? id;
       contentSlug  = vid.slug ?? cover.contentSlug ?? null;
-      // programId/programSlug déjà assignés depuis prog
     } else {
-      // CoverOfProgram ou fallback
       contentType = 'program';
-      // Le 1er CTA de type PLAY donne la vidéo à jouer
       const ctaPlay = cover.callToAction?.items?.find((i: any) => i.type === 'PLAY' || i.__typename === 'WatchButtonAction');
       contentId    = ctaPlay?.video?.id ?? ctaPlay?.id ?? prog.id ?? id;
       contentSlug  = ctaPlay?.video?.slug ?? prog.slug ?? cover.contentSlug ?? null;
     }
 
-    // ── Métadonnées ───────────────────────────────────────────────────────────
-    // Priorité : CoverOfVideo.video > CoverOfProgram.callToAction.video
     const ctaVideo = cover.callToAction?.items?.find((i: any) => i.video)?.video ?? {};
     const season   = vid.season   ?? ctaVideo?.season   ?? null;
     const episode  = vid.episode  ?? ctaVideo?.episode  ?? null;
     const duration = vid.playingInfos?.duration ?? ctaVideo?.playingInfos?.duration ?? null;
     const rights   = vid.rights   ?? ctaVideo?.rights   ?? cover.rights ?? [];
 
-    // Topics depuis le programme associé (CoverOfVideo: vid.program, CoverOfProgram: prog)
     const topicsSource = (typename === 'CoverOfVideo' ? vid.program : prog) ?? prog;
 
     banners.push({
@@ -860,7 +839,6 @@ function buildTF1Banners(tf1Raw: any): any[] {
     });
   }
 
-  // Fallback : prend les 5 premiers items du premier slider
   if (banners.length === 0) {
     const sliders: any[] = tf1Raw?.data?.homeSliders ?? [];
     for (const item of (sliders[0]?.items ?? []).slice(0, 5)) {
@@ -872,6 +850,7 @@ function buildTF1Banners(tf1Raw: any): any[] {
       const desc     = prog.decoration?.catchPhrase ?? '';
       const thumbSrc = [...(prog.decoration?.thumbnail?.sourcesWithScales ?? [])].sort((a: any, b: any) => (b.scale ?? 0) - (a.scale ?? 0));
       const portSrc  = [...(prog.decoration?.portrait?.sourcesWithScales  ?? [])].sort((a: any, b: any) => (b.scale ?? 0) - (a.scale ?? 0));
+
       const bgUrl    = thumbSrc[0]?.url ?? '';
       const portUrl  = portSrc[0]?.url ?? '';
 
@@ -892,6 +871,90 @@ function buildTF1Banners(tf1Raw: any): any[] {
   return banners;
 }
 
+// ─── Handler /list ────────────────────────────────────────────────────────────
+
+async function handleListRequest(
+  url: URL,
+  env: Env,
+  corsHeaders: Record<string, string>,
+): Promise<Response> {
+  const theme = url.searchParams.get('theme') as ThemeKey | null;
+
+  if (!theme || !(theme in THEMES)) {
+    return new Response(JSON.stringify({ error: 'Paramètre theme invalide ou manquant' }), {
+      status: 400,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+
+  // Récupérer le cache LLM
+  const llmCacheRaw = await env.LABEL_CACHE.get('label_map').catch(() => null);
+  const llmCache: Record<string, ThemeKey> = llmCacheRaw ? JSON.parse(llmCacheRaw) : {};
+
+  const rtbfCategoryPath = RTBF_CATEGORY_PATHS[theme];
+  const rtbfWidgetId     = RTBF_WIDGET_IDS[theme];
+  const tf1Slug          = TF1_CATEGORY_SLUGS[theme];
+  const widgetTitle      = RTBF_WIDGET_FORCE_TITLES[theme] ?? '';
+
+  // Fetch RTBF + TF1 en parallèle
+  const [rtbfResult, tf1Result] = await Promise.allSettled([
+    rtbfCategoryPath
+      ? fetchRTBFCategoryPage(rtbfCategoryPath)
+      : rtbfWidgetId
+        ? fetchRTBFWidget(`https://bff-service.rtbf.be/auvio/v1.23/widgets/${rtbfWidgetId}`)
+        : Promise.resolve([]),
+    tf1Slug ? fetchTF1Category(tf1Slug) : Promise.resolve([]),
+  ]);
+
+  // Normaliser RTBF
+  let rtbfItems: NormalizedItem[] = [];
+  if (rtbfResult.status === 'fulfilled') {
+    for (const raw of rtbfResult.value) {
+      const item = normalizeRTBFItem(raw, llmCache, widgetTitle);
+      if (item) rtbfItems.push(item);
+    }
+    rtbfItems = deduplicate(rtbfItems);
+  }
+
+  // Normaliser TF1
+  let tf1Items: NormalizedItem[] = [];
+  if (tf1Result.status === 'fulfilled') {
+    for (const raw of tf1Result.value) {
+      const item = normalizeTF1Item(raw, llmCache);
+      if (item) tf1Items.push(item);
+    }
+    tf1Items = deduplicate(tf1Items);
+  }
+
+  // Interleave RTBF + TF1
+  const merged: NormalizedItem[] = [];
+  let r = 0, t = 0;
+  while (r < rtbfItems.length || t < tf1Items.length) {
+    if (r < rtbfItems.length) merged.push(rtbfItems[r++]);
+    if (t < tf1Items.length)  merged.push(tf1Items[t++]);
+  }
+
+  console.log(`[/list] theme=${theme} rtbf=${rtbfItems.length} tf1=${tf1Items.length} total=${merged.length}`);
+
+  return new Response(JSON.stringify({
+    theme,
+    label: THEMES[theme].label,
+    emoji: THEMES[theme].emoji,
+    items: merged,
+    meta: {
+      rtbf:  rtbfItems.length,
+      tf1:   tf1Items.length,
+      total: merged.length,
+    },
+  }), {
+    headers: {
+      ...corsHeaders,
+      'Content-Type': 'application/json',
+      'Cache-Control': 'public, max-age=300',
+    },
+  });
+}
+
 // ─── Handler principal ────────────────────────────────────────────────────────
 
 export default {
@@ -908,12 +971,26 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
+    // ── Route /list ──────────────────────────────────────────────────────────
+    if (url.pathname === '/list') {
+      try {
+        return await handleListRequest(url, env, corsHeaders);
+      } catch (err: any) {
+        console.error('[worker] /list error:', err);
+        return new Response(JSON.stringify({ error: err.message }), {
+          status: 500,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
+    }
+
+    // ── Route /home ──────────────────────────────────────────────────────────
     if (url.pathname !== '/home') {
       return new Response('Not found', { status: 404, headers: corsHeaders });
     }
 
     try {
-      // ── 1. Fetch RTBF + TF1 en parallèle ──────────────────────────────────
+      // 1. Fetch RTBF + TF1 en parallèle
       const [rtbfResult, tf1Result] = await Promise.allSettled([
         fetchRTBF(),
         fetchTF1(),
@@ -925,8 +1002,7 @@ export default {
       if (rtbfResult.status === 'rejected') console.error('[worker] RTBF fetch error:', rtbfResult.reason);
       if (tf1Result.status  === 'rejected') console.error('[worker] TF1 fetch error:',  tf1Result.reason);
 
-      // ── 2. Banners hero ────────────────────────────────────────────────────
-      // Pour RTBF, le PROMOBOX doit être fetché séparément (widget contentPath)
+      // 2. Banners hero
       let rtbfPromoItems: any[] = [];
       if (rtbfHome) {
         const promoWidget = (rtbfHome.data?.widgets ?? []).find((w: any) => w.type === 'PROMOBOX');
@@ -951,29 +1027,24 @@ export default {
         ...(tf1Raw   ? buildTF1Banners(tf1Raw)                    : []),
       ];
 
-      // ── 3. Lire le cache LLM une seule fois ────────────────────────────────
+      // 3. Cache LLM
       const llmCacheRaw = await env.LABEL_CACHE.get('label_map').catch(() => null);
       const llmCache: Record<string, ThemeKey> = llmCacheRaw ? JSON.parse(llmCacheRaw) : {};
 
-      // ── 4. Normaliser items RTBF ───────────────────────────────────────────
+      // 4. Normaliser RTBF
       let rtbfItems: NormalizedItem[] = [];
       if (rtbfHome) {
-        // EXCLUDED : widgets qui n'ont pas d'items à afficher comme cartes
-        // PROMOBOX → géré par buildRTBFBanners (banners hero)
-        // BANNER   → plus utilisé par RTBF (remplacé par PROMOBOX)
         const EXCLUDED = new Set([
           'FAVORITE_PROGRAM_LIST', 'CHANNEL_LIST', 'ONGOING_PLAY_HISTORY',
-          'CATEGORY_LIST', 'BANNER', 'MEDIA_TRAILER',
-          'PROMOBOX', // Géré séparément dans buildRTBFBanners
+          'CATEGORY_LIST', 'BANNER', 'MEDIA_TRAILER', 'PROMOBOX',
         ]);
         const widgets = rtbfHome.data?.widgets ?? [];
 
-        // Construire les fetches avec le titre du widget (pour Kids detection)
         const widgetMetas = widgets
           .filter((w: any) => !EXCLUDED.has(w.type) && w.contentPath)
           .map((w: any) => ({ title: w.title ?? '', fetch: fetchRTBFWidget(w.contentPath) }));
 
-        const fetches     = widgetMetas.map((m: any) => m.fetch);
+        const fetches      = widgetMetas.map((m: any) => m.fetch);
         const widgetTitles = widgetMetas.map((m: any) => m.title);
 
         const results = await Promise.allSettled(fetches);
@@ -988,7 +1059,7 @@ export default {
         }
       }
 
-      // ── 5. Normaliser items TF1 ────────────────────────────────────────────
+      // 5. Normaliser TF1
       let tf1Items: NormalizedItem[] = [];
       if (tf1Raw) {
         const sliders = tf1Raw.data?.homeSliders ?? [];
@@ -1000,14 +1071,11 @@ export default {
         }
       }
 
-      // ── 6. Déduplication par plateforme ───────────────────────────────────
+      // 6. Déduplication
       rtbfItems = deduplicate(rtbfItems);
       tf1Items  = deduplicate(tf1Items);
 
-      // ── 7. AI : uniquement pour les labels résiduels inconnus ─────────────
-      // On ne classe pas comme "inconnu" un item qui a un thème != 'series'
-      // ou qui a une typology/topic reconnue. L'AI ne traite que les labels
-      // catégorisés 'series' dont la catégorie brute est inconnue.
+      // 7. AI pour labels inconnus résiduels
       const allForAI = [...rtbfItems, ...tf1Items];
       const unknownLabels = [...new Set(
         allForAI
@@ -1024,23 +1092,21 @@ export default {
           const updatedCache = { ...llmCache, ...newMappings };
           await env.LABEL_CACHE.put('label_map', JSON.stringify(updatedCache), { expirationTtl: 604800 });
 
-          // Reclassifier les items affectés
           for (const item of allForAI) {
             if (item.theme === 'series' && item.categoryLabel) {
               const k = normalizeLabel(item.categoryLabel);
               if (newMappings[k]) item.theme = newMappings[k];
             }
           }
-          // Re-split après mise à jour
           rtbfItems = allForAI.filter(i => i.platform === 'RTBF');
           tf1Items  = allForAI.filter(i => i.platform === 'TF1+');
         }
       }
 
-      // ── 8. Construire les buckets (interleaved RTBF + TF1) ────────────────
+      // 8. Buckets
       const buckets = buildBuckets(rtbfItems, tf1Items);
 
-      // ── 9. Répondre ────────────────────────────────────────────────────────
+      // 9. Répondre
       console.log(`[worker] rtbf=${rtbfItems.length} tf1=${tf1Items.length} buckets=${buckets.length} ai_calls=${unknownLabels.length}`);
 
       return new Response(JSON.stringify({
