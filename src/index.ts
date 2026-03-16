@@ -313,11 +313,16 @@ const GENRE_MAP: Record<string, string> = {
 /**
  * Construit genres[] unifiés depuis les sources brutes d'un item.
  *
- * Pour RTBF : categoryLabel (ex: "Policier", "Comédie dramatique")
- * Pour TF1  : typology (ex: "Téléfilm") + topics[] (ex: ["Biopic", "Musique"])
+ * Sources utilisées (par priorité) :
+ *   RTBF  → categoryLabel de l'item (souvent absent) OU widgetTitle du widget parent
+ *            ex: widget "Romance" → genres:["Romance"]
+ *                widget "Thrillers, Aventure, Action" → genres:["Thriller","Aventure","Action"]
+ *                widget "Notre sélection" → genres:[] (titre éditorial non mappé)
+ *   TF1+  → typology (ex: "Téléfilm") + topics[] (ex: ["Biopic","Musique"])
+ *            ex: typology="Téléfilm" topics=["Biopic","Musique"] → genres:["Téléfilm","Biopic","Musique"]
  *
- * Retourne un tableau dédupliqué de genres en français naturel,
- * prêt à être utilisé dans les filtres de ListPage — identique pour les deux plateformes.
+ * Les titres composites sont splittés sur virgule/slash/tiret long.
+ * Retourne un tableau dédupliqué, vide si aucun genre reconnu.
  */
 function buildGenres(
   categoryLabel: string | undefined,
@@ -327,19 +332,26 @@ function buildGenres(
   const genres = new Set<string>();
 
   const tryAdd = (raw: string) => {
-    if (!raw) return;
-    const k = normalizeLabel(raw);
+    if (!raw?.trim()) return;
+    const k = normalizeLabel(raw.trim());
+    // Lookup exact
     const g = GENRE_MAP[k];
-    if (g) genres.add(g);
-    else {
-      // Essai partiel : si le label contient un fragment connu
-      for (const [frag, genre] of Object.entries(GENRE_MAP)) {
-        if (frag.length >= 5 && k.includes(frag)) { genres.add(genre); break; }
-      }
+    if (g) { genres.add(g); return; }
+    // Lookup partiel : le fragment doit être assez long pour être significatif
+    for (const [frag, genre] of Object.entries(GENRE_MAP)) {
+      if (frag.length >= 5 && k.includes(frag)) { genres.add(genre); return; }
     }
   };
 
-  if (categoryLabel) tryAdd(categoryLabel);
+  // Splitter les labels composites : "Thrillers, Aventure, Action" → ["Thrillers","Aventure","Action"]
+  const splitAndTryAdd = (raw: string) => {
+    if (!raw) return;
+    // Split sur virgule, slash, " & ", " et "
+    const parts = raw.split(/[,\/]|\s+&\s+|\s+et\s+/i);
+    for (const part of parts) tryAdd(part);
+  };
+
+  if (categoryLabel) splitAndTryAdd(categoryLabel);
   if (typology)      tryAdd(typology);
   if (topics?.length) {
     for (const t of topics) tryAdd(t);
@@ -614,12 +626,16 @@ async function fetchTF1CategorySliders(slugs: string[]): Promise<any[]> {
       }
 
       // ── sliders[].items[] ─────────────────────────────────────────────────
-      // C'est ici que sont les VRAIS programmes de la catégorie
+      // C'est ici que sont les VRAIS programmes de la catégorie.
+      // On injecte _sliderTitle sur chaque item pour que normalizeTF1Item
+      // puisse l'utiliser comme source de genre supplémentaire.
       for (const slider of (cat.sliders ?? [])) {
-        const sliderItems: any[] = slider.items ?? slider.programs ?? [];
+        const sliderTitle: string = slider.title ?? slider.decoration?.label ?? '';
+        const sliderItems: any[] = (slider.items ?? slider.programs ?? [])
+          .map((i: any) => ({ ...i, _sliderTitle: sliderTitle }));
         allItems.push(...sliderItems);
         slidersItemsCount += sliderItems.length;
-        console.log(`[TF1 cat] slug=${slug} slider="${slider.title ?? slider.id}" items=${sliderItems.length}`);
+        console.log(`[TF1 cat] slug=${slug} slider="${sliderTitle}" items=${sliderItems.length}`);
       }
 
       console.log(`[TF1 cat] slug=${slug} covers=${coversCount} sliderItems=${slidersItemsCount} total=${allItems.length}`);
@@ -703,7 +719,11 @@ function normalizeRTBFItem(
     path:          item.path,
     rating:        item.rating,
     theme,
-    genres: buildGenres(item.categoryLabel, undefined, undefined),
+    // RTBF : les items de widget n'ont souvent pas de categoryLabel.
+    // Le seul signal de genre fiable est le titre du widget parent
+    // (ex: widget "Romance" id=24404, "Comédie", "Drame"…).
+    // On prend categoryLabel en priorité, sinon widgetTitle comme fallback.
+    genres: buildGenres(item.categoryLabel || widgetTitle, undefined, undefined),
     _raw: item,
   };
 }
@@ -871,7 +891,8 @@ function normalizeTF1Item(
     resourceType,
     path: `/tf1/${resourceType === 'MEDIA' ? 'video' : 'program'}/${mediaId ?? id}`,
     theme,
-    genres: buildGenres(undefined, typology, topics),
+    // genres : typology + topics (propres à l'item) + sliderTitle (contexte éditorial TF1)
+    genres: buildGenres(item._sliderTitle || undefined, typology, topics),
     _raw: enrichedRaw,
   };
 }
