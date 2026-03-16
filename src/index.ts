@@ -311,18 +311,9 @@ const GENRE_MAP: Record<string, string> = {
 };
 
 /**
- * Construit genres[] unifiés depuis les sources brutes d'un item.
- *
- * Sources utilisées (par priorité) :
- *   RTBF  → categoryLabel de l'item (souvent absent) OU widgetTitle du widget parent
- *            ex: widget "Romance" → genres:["Romance"]
- *                widget "Thrillers, Aventure, Action" → genres:["Thriller","Aventure","Action"]
- *                widget "Notre sélection" → genres:[] (titre éditorial non mappé)
- *   TF1+  → typology (ex: "Téléfilm") + topics[] (ex: ["Biopic","Musique"])
- *            ex: typology="Téléfilm" topics=["Biopic","Musique"] → genres:["Téléfilm","Biopic","Musique"]
- *
- * Les titres composites sont splittés sur virgule/slash/tiret long.
- * Retourne un tableau dédupliqué, vide si aucun genre reconnu.
+ * Construit genres[] depuis les sources structurées d'un item.
+ * Utilisé quand l'info est disponible (TF1 typology+topics, RTBF categoryLabel).
+ * Pour les items sans info structurée → classifyGenresWithAI() prend le relais.
  */
 function buildGenres(
   categoryLabel: string | undefined,
@@ -334,31 +325,141 @@ function buildGenres(
   const tryAdd = (raw: string) => {
     if (!raw?.trim()) return;
     const k = normalizeLabel(raw.trim());
-    // Lookup exact
     const g = GENRE_MAP[k];
     if (g) { genres.add(g); return; }
-    // Lookup partiel : le fragment doit être assez long pour être significatif
+    // Essai partiel sur fragments significatifs
     for (const [frag, genre] of Object.entries(GENRE_MAP)) {
       if (frag.length >= 5 && k.includes(frag)) { genres.add(genre); return; }
     }
   };
 
-  // Splitter les labels composites : "Thrillers, Aventure, Action" → ["Thrillers","Aventure","Action"]
-  const splitAndTryAdd = (raw: string) => {
+  // Split les labels composites : "Thrillers, Aventure, Action" → plusieurs genres
+  const splitAndAdd = (raw: string) => {
     if (!raw) return;
-    // Split sur virgule, slash, " & ", " et "
-    const parts = raw.split(/[,\/]|\s+&\s+|\s+et\s+/i);
-    for (const part of parts) tryAdd(part);
+    for (const part of raw.split(/[,\/]|\s+&\s+|\s+et\s+/i)) tryAdd(part);
   };
 
-  if (categoryLabel) splitAndTryAdd(categoryLabel);
+  if (categoryLabel) splitAndAdd(categoryLabel);
   if (typology)      tryAdd(typology);
-  if (topics?.length) {
-    for (const t of topics) tryAdd(t);
-  }
+  for (const t of (topics ?? [])) tryAdd(t);
 
   return [...genres];
 }
+
+/**
+ * Classifie les genres d'un batch d'items avec Workers AI (@cf/meta/llama-3-8b-instruct).
+ *
+ * Utilise un double cache KV :
+ *  - "genres_map" : JSON { normalizedTitle: string[] } — persiste 7 jours
+ *
+ * Pour chaque item, l'IA reçoit : titre + (subtitle ou description courte)
+ * et retourne les genres parmi le vocabulaire GENRE_MAP.
+ *
+ * Retourne un Map<normalizedTitle, string[]> pour tous les items traités.
+ */
+async function classifyGenresWithAI(
+  items: Array<{ title: string; subtitle?: string; description?: string }>,
+  env: Env,
+): Promise<Map<string, string[]>> {
+  const result = new Map<string, string[]>();
+  if (!items.length) return result;
+
+  // 1. Charger le cache genres KV
+  let genresCache: Record<string, string[]> = {};
+  try {
+    const raw = await env.LABEL_CACHE.get('genres_map');
+    if (raw) genresCache = JSON.parse(raw);
+  } catch { /* ignore */ }
+
+  // 2. Séparer ceux déjà en cache de ceux à classifier
+  const toClassify: typeof items = [];
+  for (const item of items) {
+    const k = normalizeLabel(item.title);
+    if (genresCache[k]) {
+      result.set(k, genresCache[k]);
+    } else {
+      toClassify.push(item);
+    }
+  }
+
+  if (!toClassify.length) return result;
+
+  // 3. Classifier par batches de 25 (prompt ~2k tokens, réponse ~1k)
+  const BATCH = 25;
+  const genreVocab = [...new Set(Object.values(GENRE_MAP))].join(', ');
+
+  for (let i = 0; i < toClassify.length; i += BATCH) {
+    const batch = toClassify.slice(i, i + BATCH);
+
+    const itemLines = batch.map(item => {
+      const hint = item.subtitle || (item.description?.slice(0, 120) ?? '');
+      return `- "${item.title}"${hint ? ` (${hint})` : ''}`;
+    }).join('\n');
+
+    const prompt = `Tu es un classificateur de genres pour une plateforme de streaming vidéo francophone.
+Pour chaque film/série/émission ci-dessous, retourne une liste de 1 à 3 genres parmi ce vocabulaire EXACT :
+${genreVocab}
+
+Règles :
+- Utilise UNIQUEMENT les genres du vocabulaire ci-dessus, mot pour mot
+- 1 genre minimum, 3 maximum par item
+- Réponds UNIQUEMENT avec un objet JSON valide, sans texte avant ou après
+- Format : { "Titre exact": ["Genre1", "Genre2"] }
+
+Items à classifier :
+${itemLines}`;
+
+    try {
+      const res = await env.AI.run('@cf/meta/llama-3-8b-instruct', {
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: 1024,
+      });
+
+      const text = (res as any).response ?? '';
+      const match = text.match(/\{[\s\S]*\}/);
+      if (!match) {
+        console.error('[AI genres] Réponse non parseable:', text.slice(0, 200));
+        continue;
+      }
+
+      const parsed: Record<string, string[]> = JSON.parse(match[0]);
+
+      for (const [rawTitle, rawGenres] of Object.entries(parsed)) {
+        // Valider que les genres retournés sont dans le vocabulaire
+        const validGenres = (Array.isArray(rawGenres) ? rawGenres : [])
+          .filter(g => Object.values(GENRE_MAP).includes(g))
+          .slice(0, 3);
+
+        if (!validGenres.length) continue;
+
+        // Chercher l'item correspondant (match souple sur titre normalisé)
+        const matchedItem = batch.find(it =>
+          normalizeLabel(it.title) === normalizeLabel(rawTitle) ||
+          normalizeLabel(it.title).includes(normalizeLabel(rawTitle)) ||
+          normalizeLabel(rawTitle).includes(normalizeLabel(it.title))
+        );
+
+        if (matchedItem) {
+          const k = normalizeLabel(matchedItem.title);
+          result.set(k, validGenres);
+          genresCache[k] = validGenres;
+        }
+      }
+
+      console.log(`[AI genres] batch ${Math.floor(i/BATCH)+1}: ${batch.length} items → ${Object.keys(parsed).length} classifiés`);
+    } catch (err) {
+      console.error('[AI genres] batch error:', err);
+    }
+  }
+
+  // 4. Sauvegarder le cache mis à jour
+  try {
+    await env.LABEL_CACHE.put('genres_map', JSON.stringify(genresCache), { expirationTtl: 604800 });
+  } catch { /* ignore */ }
+
+  return result;
+}
+
 
 // ─── Classification ───────────────────────────────────────────────────────────
 
@@ -719,10 +820,9 @@ function normalizeRTBFItem(
     path:          item.path,
     rating:        item.rating,
     theme,
-    // RTBF : les items de widget n'ont souvent pas de categoryLabel.
-    // Le seul signal de genre fiable est le titre du widget parent
-    // (ex: widget "Romance" id=24404, "Comédie", "Drame"…).
-    // On prend categoryLabel en priorité, sinon widgetTitle comme fallback.
+    // genres depuis les sources structurées disponibles.
+    // widgetTitle utilisé si categoryLabel absent (items sans métadonnées de genre).
+    // Les items avec genres:[] seront enrichis par l'IA dans handleListRequest.
     genres: buildGenres(item.categoryLabel || widgetTitle, undefined, undefined),
     _raw: item,
   };
@@ -891,7 +991,8 @@ function normalizeTF1Item(
     resourceType,
     path: `/tf1/${resourceType === 'MEDIA' ? 'video' : 'program'}/${mediaId ?? id}`,
     theme,
-    // genres : typology + topics (propres à l'item) + sliderTitle (contexte éditorial TF1)
+    // genres depuis typology + topics TF1 + sliderTitle éditorial (ex: "Films romantiques")
+    // Items sans genres → enrichis par l'IA dans handleListRequest
     genres: buildGenres(item._sliderTitle || undefined, typology, topics),
     _raw: enrichedRaw,
   };
@@ -1115,6 +1216,45 @@ async function handleListRequest(
 
   rtbfItems = deduplicate(rtbfItems);
   tf1Items  = deduplicate(tf1Items);
+
+  // ── Classification IA des genres ──────────────────────────────────────────
+  // Tous les items sans genres[] (ou genres vide) sont soumis à l'IA.
+  // Cela couvre principalement les items RTBF issus de widgets éditoriaux
+  // ("Notre sélection", "Salués par la critique"…) qui n'ont ni categoryLabel
+  // ni topics — leur titre+description est le seul signal disponible.
+  //
+  // Les items TF1 ont généralement déjà des genres via typology+topics,
+  // mais s'ils sont vides, ils passent aussi par l'IA.
+  //
+  // Le cache KV (clé "genres_map") évite les appels répétés pour les mêmes titres.
+
+  const allItems = [...rtbfItems, ...tf1Items];
+  const needsAI  = allItems.filter(i => i.genres.length === 0);
+
+  if (needsAI.length > 0) {
+    console.log(`[/list] AI genre classification: ${needsAI.length} items sans genres`);
+
+    const aiInput = needsAI.map(i => ({
+      title:       i.title,
+      subtitle:    i.subtitle,
+      description: i.description,
+    }));
+
+    const aiResult = await classifyGenresWithAI(aiInput, env);
+
+    // Appliquer les genres classifiés par l'IA
+    for (const item of allItems) {
+      if (item.genres.length === 0) {
+        const k = normalizeLabel(item.title);
+        const aiGenres = aiResult.get(k);
+        if (aiGenres?.length) item.genres = aiGenres;
+      }
+    }
+
+    // Re-split après enrichissement
+    rtbfItems = allItems.filter(i => i.platform === 'RTBF');
+    tf1Items  = allItems.filter(i => i.platform === 'TF1+');
+  }
 
   // ── Interleave RTBF + TF1 ─────────────────────────────────────────────────
   const merged: NormalizedItem[] = [];
