@@ -34,6 +34,12 @@ interface NormalizedItem {
   path?: string;
   rating?: string | null;
   theme: ThemeKey;
+  /**
+   * Genres unifiés : vocabulaire commun RTBF + TF1+, utilisé pour les filtres
+   * côté frontend. Calculé depuis categoryLabel (RTBF) et typology+topics (TF1).
+   * Ex: ["Comédie", "Romance"], ["Policier"], ["Documentaire", "Nature"]
+   */
+  genres: string[];
   _raw: any;
 }
 
@@ -184,6 +190,163 @@ const TF1_CATEGORY_SLIDERS_QID = '46f87e88577a61abb1d2a36a715a12d4175caa3d';
 /** Query ID de la home (homeSliders) */
 const TF1_HOME_QID   = 'c34093152db844db6b7ad9b56df12841f7d13182';
 const TF1_BANNER_QID = 'bd8e6aab9996844dad4ea9a53887adad27d86151';
+
+// ─── Vocabulaire de genres unifiés ───────────────────────────────────────────
+//
+// Chaque entrée mappe un label brut (normalisé sans accents) vers un genre
+// affiché dans les filtres de ListPage.
+// Couvre à la fois les categoryLabel RTBF et les typology/topics TF1.
+// Le label affiché est en français naturel, avec majuscule.
+
+const GENRE_MAP: Record<string, string> = {
+  // ── Films / Cinéma ──────────────────────────────────────────────────────────
+  'film': 'Film',
+  'films': 'Film',
+  'cinema': 'Film',
+  'telefilm': 'Téléfilm',
+  'telefilms': 'Téléfilm',
+  'biopic': 'Biopic',
+  'western': 'Western',
+  'animation': 'Animation',
+  // ── Genres narratifs ────────────────────────────────────────────────────────
+  'comedie': 'Comédie',
+  'comedie dramatique': 'Comédie dramatique',
+  'comedie romantique': 'Comédie romantique',
+  'drame': 'Drame',
+  'romance': 'Romance',
+  'action': 'Action',
+  'aventure': 'Aventure',
+  'science-fiction': 'Science-fiction',
+  'sf': 'Science-fiction',
+  'fantastique': 'Fantastique',
+  'horreur': 'Horreur',
+  // ── Policier / Thriller ──────────────────────────────────────────────────────
+  'policier': 'Policier',
+  'thriller': 'Thriller',
+  'polar': 'Policier',
+  'suspense': 'Thriller',
+  'crime': 'Crime',
+  'espionnage': 'Espionnage',
+  'serie policiere': 'Policier',
+  'affaires criminelles': 'Crime',
+  // ── Documentaire ─────────────────────────────────────────────────────────────
+  'documentaire': 'Documentaire',
+  'reportage': 'Reportage',
+  'reportages': 'Reportage',
+  'investigation': 'Investigation',
+  'nature': 'Nature',
+  'science': 'Science',
+  'histoire': 'Histoire',
+  'societe': 'Société',
+  'voyage': 'Voyage',
+  'enquete': 'Investigation',
+  'environnement': 'Nature',
+  'decouvertes': 'Découvertes',
+  // ── Culture / Divertissement ─────────────────────────────────────────────────
+  'humour': 'Humour',
+  'musique': 'Musique',
+  'chanson': 'Musique',
+  'concert': 'Concert',
+  'spectacle': 'Spectacle',
+  'varietes': 'Variétés',
+  'variete': 'Variétés',
+  'talk show': 'Talk-show',
+  'talk-show': 'Talk-show',
+  'talkshow': 'Talk-show',
+  'late show': 'Talk-show',
+  'game show': 'Jeux',
+  'quiz': 'Jeux',
+  'jeux': 'Jeux',
+  'magazine': 'Magazine',
+  'danse': 'Danse',
+  'people': 'People',
+  'lifestyle': 'Lifestyle',
+  'divertissement': 'Divertissement',
+  'emission': 'Émission',
+  'spectacles': 'Spectacle',
+  // ── Info ─────────────────────────────────────────────────────────────────────
+  'actualite': 'Actualité',
+  'actualites': 'Actualité',
+  'info': 'Info',
+  'journal': 'Journal',
+  'journal televise': 'Journal',
+  'politique': 'Politique',
+  'economie': 'Économie',
+  'debat': 'Débat',
+  'faits divers': 'Faits divers',
+  // ── Téléréalité ───────────────────────────────────────────────────────────────
+  'telerealite': 'Téléréalité',
+  'docu-realite': 'Docu-réalité',
+  'survie': 'Survie',
+  'mariage': 'Mariage',
+  'famille': 'Famille',
+  // ── Sport ─────────────────────────────────────────────────────────────────────
+  'sport': 'Sport',
+  'football': 'Football',
+  'rugby': 'Rugby',
+  'cyclisme': 'Cyclisme',
+  'tennis': 'Tennis',
+  'natation': 'Natation',
+  'athletisme': 'Athlétisme',
+  'formule 1': 'Formule 1',
+  'f1': 'Formule 1',
+  'moto': 'Moto',
+  'moteurs': 'Sports mécaniques',
+  'basket': 'Basket',
+  'boxe': 'Boxe',
+  'golf': 'Golf',
+  // ── Kids ─────────────────────────────────────────────────────────────────────
+  'jeunesse': 'Jeunesse',
+  'kids': 'Jeunesse',
+  'enfants': 'Jeunesse',
+  'anime': 'Animé',
+  'dessin anime': 'Animé',
+  'serie animee': 'Animé',
+  'animation jeunesse': 'Animé',
+  // ── Séries ────────────────────────────────────────────────────────────────────
+  'serie': 'Série',
+  'sitcom': 'Sitcom',
+  'feuilleton': 'Feuilleton',
+  'mini serie': 'Mini-série',
+};
+
+/**
+ * Construit genres[] unifiés depuis les sources brutes d'un item.
+ *
+ * Pour RTBF : categoryLabel (ex: "Policier", "Comédie dramatique")
+ * Pour TF1  : typology (ex: "Téléfilm") + topics[] (ex: ["Biopic", "Musique"])
+ *
+ * Retourne un tableau dédupliqué de genres en français naturel,
+ * prêt à être utilisé dans les filtres de ListPage — identique pour les deux plateformes.
+ */
+function buildGenres(
+  categoryLabel: string | undefined,
+  typology: string | undefined,
+  topics: string[] | undefined,
+): string[] {
+  const genres = new Set<string>();
+
+  const tryAdd = (raw: string) => {
+    if (!raw) return;
+    const k = normalizeLabel(raw);
+    const g = GENRE_MAP[k];
+    if (g) genres.add(g);
+    else {
+      // Essai partiel : si le label contient un fragment connu
+      for (const [frag, genre] of Object.entries(GENRE_MAP)) {
+        if (frag.length >= 5 && k.includes(frag)) { genres.add(genre); break; }
+      }
+    }
+  };
+
+  if (categoryLabel) tryAdd(categoryLabel);
+  if (typology)      tryAdd(typology);
+  if (topics?.length) {
+    for (const t of topics) tryAdd(t);
+  }
+
+  return [...genres];
+}
 
 // ─── Classification ───────────────────────────────────────────────────────────
 
@@ -540,6 +703,7 @@ function normalizeRTBFItem(
     path:          item.path,
     rating:        item.rating,
     theme,
+    genres: buildGenres(item.categoryLabel, undefined, undefined),
     _raw: item,
   };
 }
@@ -707,6 +871,7 @@ function normalizeTF1Item(
     resourceType,
     path: `/tf1/${resourceType === 'MEDIA' ? 'video' : 'program'}/${mediaId ?? id}`,
     theme,
+    genres: buildGenres(undefined, typology, topics),
     _raw: enrichedRaw,
   };
 }
