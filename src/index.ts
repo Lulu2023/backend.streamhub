@@ -1,4 +1,4 @@
-/**
+x/**
  * Cloudflare Worker — Aggregateur multi-plateforme StreamHub
  *
  * GET /home              → { buckets, heroBanners, meta }
@@ -443,7 +443,7 @@ Items :
 ${itemLines}`;
 
     try {
-      const res = await env.AI.run('@cf/meta/llama-3-8b-instruct', {
+      const res = await env.AI.run('@cf/meta/llama-3.2-1b-instruct', {
         messages: [{ role: 'user', content: prompt }],
         max_tokens: 768,
       });
