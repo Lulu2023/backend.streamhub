@@ -9,9 +9,19 @@ enabled = true
 [ai]
 binding = "AI"
 
-# KV namespace pour le cache des labels Ollama
-# Créer avec : wrangler kv:namespace create LABEL_CACHE
-# Puis remplacer l'id ci-dessous par celui retourné
+# KV namespace pour le cache des labels IA (classification thème/genre)
 [[kv_namespaces]]
 binding = "LABEL_CACHE"
 id = "4075fb3d1bdc42f8a94dd012dc91470f"
+
+# KV namespace pour les données précalculées (home + list par thème)
+# Créer avec : wrangler kv:namespace create DATA_CACHE
+# Puis remplacer l'id ci-dessous par celui retourné
+[[kv_namespaces]]
+binding = "DATA_CACHE"
+id = "REMPLACER_PAR_ID_DATA_CACHE"
+
+# Cron Trigger — rafraîchit les données toutes les 3h en background
+# Le worker tourne sans requête utilisateur, met à jour DATA_CACHE
+[triggers]
+crons = ["0 */3 * * *"]
