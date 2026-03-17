@@ -15,7 +15,7 @@
  *   [ai]              binding = "AI"
  *   [[kv_namespaces]] binding = "LABEL_CACHE"   (labels IA)
  *   [[kv_namespaces]] binding = "DATA_CACHE"    (données précalculées)
- *   [triggers]        crons = ["0 */3 * * *"]
+ *   [triggers]        crons = ["0 every-3h * * *"]  (voir wrangler.toml)
  */
 
 export interface Env {
