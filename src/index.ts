@@ -1,18 +1,32 @@
 /**
  * Cloudflare Worker — Aggregateur multi-plateforme StreamHub
  *
- * GET /home              → { buckets, heroBanners, meta }
- * GET /list?theme=<key>  → { theme, label, emoji, items[], meta }
+ * GET /home                    → { buckets, heroBanners, meta }         (DATA_CACHE, ~instantané)
+ * GET /list?theme=<key>&page=N → { items[], meta }                      (DATA_CACHE, ~instantané)
+ * GET /genres?theme=<key>      → { genres: {id,genres[]}[] }            (genres de TOUS les items)
+ *
+ * Architecture :
+ *  - DATA_CACHE KV stocke home_data + list_<theme> précalculés
+ *  - Les requêtes servent depuis KV instantanément (< 50ms)
+ *  - Le cron scheduled() tourne toutes les 3h et refresh en background
+ *  - Si DATA_CACHE vide (premier démarrage), fetch live + mise en cache
  *
  * Bindings requis (wrangler.toml) :
  *   [ai]              binding = "AI"
- *   [[kv_namespaces]] binding = "LABEL_CACHE"
+ *   [[kv_namespaces]] binding = "LABEL_CACHE"   (labels IA)
+ *   [[kv_namespaces]] binding = "DATA_CACHE"    (données précalculées)
+ *   [triggers]        crons = ["0 */3 * * *"]
  */
 
 export interface Env {
   AI: Ai;
   LABEL_CACHE: KVNamespace;
+  DATA_CACHE: KVNamespace;
 }
+
+// TTL cache KV — 4h fresh (cron toutes les 3h), 24h expiration sécurité
+const CACHE_TTL_FRESH = 4 * 60 * 60;
+const CACHE_TTL_STALE = 24 * 60 * 60;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -443,7 +457,7 @@ Items :
 ${itemLines}`;
 
     try {
-      const res = await env.AI.run('@cf/meta/llama-3.2-1b-instruct', {
+      const res = await env.AI.run('@cf/meta/llama-3-8b-instruct', {
         messages: [{ role: 'user', content: prompt }],
         max_tokens: 768,
       });
@@ -1168,27 +1182,40 @@ function buildTF1Banners(tf1Raw: any): any[] {
   return banners;
 }
 
-// ─── Handler /list ────────────────────────────────────────────────────────────
+// ─── Helpers cache ────────────────────────────────────────────────────────────
 
-async function handleListRequest(
-  url: URL,
-  env: Env,
-  cors: Record<string, string>,
-): Promise<Response> {
-  const theme = url.searchParams.get('theme') as ThemeKey | null;
-  if (!theme || !(theme in THEMES)) {
-    return new Response(JSON.stringify({ error: 'theme invalide' }), {
-      status: 400, headers: { ...cors, 'Content-Type': 'application/json' },
-    });
-  }
+const HEAVY_KEYS = new Set([
+  'decoration', 'badges', 'editorBadges', 'callToAction',
+  'sliders', 'covers', 'program', '_sliderTitle',
+]);
 
+/** Allège _raw en retirant les champs TF1 lourds déjà compilés dans illustration */
+function slimItem(item: NormalizedItem): NormalizedItem {
+  if (!item._raw) return item;
+  return {
+    ...item,
+    _raw: Object.fromEntries(
+      Object.entries(item._raw).filter(([k]) => !HEAVY_KEYS.has(k))
+    ),
+  };
+}
+
+/** Clé KV pour les données d'un thème */
+const listKey  = (theme: ThemeKey) => `list_v2_${theme}`;
+const homeKey  = () => 'home_v2';
+
+// ─── Précalcul d'un thème (fetch + normalise + genres IA) ─────────────────────
+
+async function buildListData(theme: ThemeKey, env: Env): Promise<{
+  items: NormalizedItem[];
+  meta: { rtbf: number; tf1: number; total: number; builtAt: number };
+}> {
   const llmCacheRaw = await env.LABEL_CACHE.get('label_map').catch(() => null);
   const llmCache: Record<string, ThemeKey> = llmCacheRaw ? JSON.parse(llmCacheRaw) : {};
 
   const rtbfCfg = RTBF_LIST_CONFIG[theme];
   const tf1Cfg  = TF1_LIST_CONFIG[theme];
 
-  // ── Fetch en parallèle ────────────────────────────────────────────────────
   const rtbfPromise: Promise<{ items: any[]; widgetTitle: string }[]> = rtbfCfg
     ? rtbfCfg.type === 'category'
       ? fetchRTBFCategoryAll(rtbfCfg.path)
@@ -1207,7 +1234,6 @@ async function handleListRequest(
 
   const [rtbfRes, tf1Res] = await Promise.allSettled([rtbfPromise, tf1Promise]);
 
-  // ── Normalisation RTBF ─────────────────────────────────────────────────────
   let rtbfItems: NormalizedItem[] = [];
   if (rtbfRes.status === 'fulfilled') {
     for (const { items, widgetTitle } of rtbfRes.value) {
@@ -1218,7 +1244,6 @@ async function handleListRequest(
     }
   }
 
-  // ── Normalisation TF1 ─────────────────────────────────────────────────────
   let tf1Items: NormalizedItem[] = [];
   if (tf1Res.status === 'fulfilled') {
     for (const raw of tf1Res.value) {
@@ -1227,8 +1252,7 @@ async function handleListRequest(
     }
   }
 
-  // ── Filtrage thématique post-normalisation ────────────────────────────────
-  // Les sources qui partagent series-35 ou divertissement contiennent tout → on filtre
+  // Filtrage thématique post-normalisation
   if (theme === 'thriller') {
     rtbfItems = rtbfItems.filter(i => i.theme === 'thriller');
     tf1Items  = tf1Items.filter(i => i.theme === 'thriller');
@@ -1243,100 +1267,195 @@ async function handleListRequest(
   rtbfItems = deduplicate(rtbfItems);
   tf1Items  = deduplicate(tf1Items);
 
-  // ── Classification IA des genres ──────────────────────────────────────────
-  // Tous les items sans genres[] (ou genres vide) sont soumis à l'IA.
-  // Cela couvre principalement les items RTBF issus de widgets éditoriaux
-  // ("Notre sélection", "Salués par la critique"…) qui n'ont ni categoryLabel
-  // ni topics — leur titre+description est le seul signal disponible.
-  //
-  // Les items TF1 ont généralement déjà des genres via typology+topics,
-  // mais s'ils sont vides, ils passent aussi par l'IA.
-  //
-  // Le cache KV (clé "genres_map") évite les appels répétés pour les mêmes titres.
-
+  // Classification IA des genres sur TOUS les items (pas juste une page)
   const allItems = [...rtbfItems, ...tf1Items];
   const needsAI  = allItems.filter(i => i.genres.length === 0);
-
   if (needsAI.length > 0) {
-    console.log(`[/list] AI genre classification: ${needsAI.length} items sans genres`);
-
-    const aiInput = needsAI.map(i => ({
-      id:          i.id,
-      title:       i.title,
-      subtitle:    i.subtitle,
-      description: i.description,
-    }));
-
-    const aiResult = await classifyGenresWithAI(aiInput, env);
-
-    // Appliquer les genres classifiés par l'IA (match par ID)
+    console.log(`[buildList:${theme}] AI: ${needsAI.length} items sans genres`);
+    const aiResult = await classifyGenresWithAI(
+      needsAI.map(i => ({ id: i.id, title: i.title, subtitle: i.subtitle, description: i.description })),
+      env,
+    );
     for (const item of allItems) {
       if (item.genres.length === 0) {
-        const aiGenres = aiResult.get(item.id);
-        if (aiGenres?.length) item.genres = aiGenres;
+        const g = aiResult.get(item.id);
+        if (g?.length) item.genres = g;
       }
     }
-
-    // Re-split après enrichissement
-    rtbfItems = allItems.filter(i => i.platform === 'RTBF');
-    tf1Items  = allItems.filter(i => i.platform === 'TF1+');
   }
 
-  // ── Interleave RTBF + TF1 ─────────────────────────────────────────────────
+  // Interleave RTBF + TF1
   const merged: NormalizedItem[] = [];
   let r = 0, t = 0;
-  while (r < rtbfItems.length || t < tf1Items.length) {
-    if (r < rtbfItems.length) merged.push(rtbfItems[r++]);
-    if (t < tf1Items.length)  merged.push(tf1Items[t++]);
+  const rf = allItems.filter(i => i.platform === 'RTBF');
+  const tf = allItems.filter(i => i.platform === 'TF1+');
+  while (r < rf.length || t < tf.length) {
+    if (r < rf.length) merged.push(rf[r++]);
+    if (t < tf.length) merged.push(tf[t++]);
   }
 
-  console.log(`[/list] theme=${theme} rtbf=${rtbfItems.length} tf1=${tf1Items.length} total=${merged.length}`);
+  console.log(`[buildList:${theme}] rtbf=${rf.length} tf1=${tf.length} total=${merged.length}`);
+  return {
+    items: merged.map(slimItem),
+    meta: { rtbf: rf.length, tf1: tf.length, total: merged.length, builtAt: Date.now() },
+  };
+}
 
-  // ── Pagination ────────────────────────────────────────────────────────────
-  const PAGE_SIZE = 48;
-  const page  = Math.max(1, parseInt(url.searchParams.get('page') ?? '1', 10));
-  const start = (page - 1) * PAGE_SIZE;
-  const end   = start + PAGE_SIZE;
-  const pageItems = merged.slice(start, end);
-  const totalPages = Math.ceil(merged.length / PAGE_SIZE);
+// ─── Précalcul home ────────────────────────────────────────────────────────────
 
-  // On garde _raw (nécessaire pour VideoCard : ids, resourceType, streamId, etc.)
-  // mais on supprime les tableaux sourcesWithScales TF1 qui sont déjà compilés
-  // dans illustration et qui alourdissent inutilement le payload.
-  const HEAVY_KEYS = new Set([
-    'decoration', 'badges', 'editorBadges', 'callToAction',
-    'sliders', 'covers', 'program', '_sliderTitle',
-  ]);
-  const slim = pageItems.map(item => ({
-    ...item,
-    _raw: item._raw
-      ? Object.fromEntries(
-          Object.entries(item._raw).filter(([k]) => !HEAVY_KEYS.has(k))
-        )
-      : undefined,
-  }));
+async function buildHomeData(env: Env): Promise<{
+  buckets: ThematicBucket[];
+  heroBanners: any[];
+  meta: any;
+}> {
+  const [rtbfResult, tf1Result] = await Promise.allSettled([fetchRTBF(), fetchTF1()]);
+  const rtbfHome = rtbfResult.status === 'fulfilled' ? rtbfResult.value : null;
+  const tf1Raw   = tf1Result.status  === 'fulfilled' ? tf1Result.value  : null;
 
-  return new Response(JSON.stringify({
-    theme, label: THEMES[theme].label, emoji: THEMES[theme].emoji,
-    items: slim,
+  if (rtbfResult.status === 'rejected') console.error('[buildHome] RTBF:', rtbfResult.reason);
+  if (tf1Result.status  === 'rejected') console.error('[buildHome] TF1:',  tf1Result.reason);
+
+  let rtbfPromoItems: any[] = [];
+  if (rtbfHome) {
+    const promoWidget = (rtbfHome.data?.widgets ?? []).find((w: any) => w.type === 'PROMOBOX');
+    if (promoWidget?.contentPath) {
+      try {
+        const pUrl = promoWidget.contentPath.startsWith('http')
+          ? promoWidget.contentPath
+          : `https://bff-service.rtbf.be${promoWidget.contentPath}`;
+        const pRes = await fetch(pUrl, { headers: { Accept: 'application/json' } });
+        if (pRes.ok) { const pj: any = await pRes.json(); rtbfPromoItems = pj?.data?.content ?? pj?.data ?? []; }
+      } catch { /* silent */ }
+    }
+  }
+
+  const heroBanners = [
+    ...(rtbfHome ? buildRTBFBanners(rtbfHome, rtbfPromoItems) : []),
+    ...(tf1Raw   ? buildTF1Banners(tf1Raw)                    : []),
+  ];
+
+  const llmCacheRaw = await env.LABEL_CACHE.get('label_map').catch(() => null);
+  const llmCache: Record<string, ThemeKey> = llmCacheRaw ? JSON.parse(llmCacheRaw) : {};
+
+  let rtbfItems: NormalizedItem[] = [];
+  if (rtbfHome) {
+    const EXCL = new Set([
+      'FAVORITE_PROGRAM_LIST', 'CHANNEL_LIST', 'ONGOING_PLAY_HISTORY',
+      'CATEGORY_LIST', 'BANNER', 'MEDIA_TRAILER', 'PROMOBOX',
+    ]);
+    const wMetas = (rtbfHome.data?.widgets ?? [])
+      .filter((w: any) => !EXCL.has(w.type) && w.contentPath)
+      .map((w: any) => ({ title: w.title ?? '', fetch: fetchRTBFWidgetAll(w.contentPath, 1) }));
+
+    const res = await Promise.allSettled(wMetas.map((m: any) => m.fetch));
+    for (let i = 0; i < res.length; i++) {
+      if (res[i].status !== 'fulfilled') continue;
+      for (const raw of (res[i] as PromiseFulfilledResult<any[]>).value) {
+        const item = normalizeRTBFItem(raw, llmCache, wMetas[i].title);
+        if (item) rtbfItems.push(item);
+      }
+    }
+  }
+
+  let tf1Items: NormalizedItem[] = [];
+  if (tf1Raw) {
+    for (const slider of tf1Raw.data?.homeSliders ?? []) {
+      for (const item of slider.items ?? []) {
+        const n = normalizeTF1Item(item, llmCache);
+        if (n) tf1Items.push(n);
+      }
+    }
+  }
+
+  rtbfItems = deduplicate(rtbfItems);
+  tf1Items  = deduplicate(tf1Items);
+
+  // AI labels inconnus pour la home
+  const allForAI = [...rtbfItems, ...tf1Items];
+  const unknownLabels = [...new Set(
+    allForAI
+      .filter(i => i.theme === 'series' && i.categoryLabel)
+      .map(i => normalizeLabel(i.categoryLabel!))
+      .filter(l => !CATEGORY_MAP[l] && !llmCache[l]),
+  )];
+
+  let newMappings: Record<string, ThemeKey> = {};
+  if (unknownLabels.length > 0) {
+    newMappings = await classifyWithWorkersAI(unknownLabels, env);
+    if (Object.keys(newMappings).length > 0) {
+      await env.LABEL_CACHE.put(
+        'label_map',
+        JSON.stringify({ ...llmCache, ...newMappings }),
+        { expirationTtl: 604800 },
+      );
+      for (const item of allForAI) {
+        if (item.theme === 'series' && item.categoryLabel) {
+          const k = normalizeLabel(item.categoryLabel);
+          if (newMappings[k]) item.theme = newMappings[k];
+        }
+      }
+      rtbfItems = allForAI.filter(i => i.platform === 'RTBF');
+      tf1Items  = allForAI.filter(i => i.platform === 'TF1+');
+    }
+  }
+
+  const buckets = buildBuckets(rtbfItems, tf1Items);
+  console.log(`[buildHome] rtbf=${rtbfItems.length} tf1=${tf1Items.length} buckets=${buckets.length}`);
+
+  return {
+    buckets,
+    heroBanners,
     meta: {
-      rtbf: rtbfItems.length,
-      tf1:  tf1Items.length,
-      total: merged.length,
-      page,
-      pageSize: PAGE_SIZE,
-      totalPages,
-      hasMore: page < totalPages,
+      rtbf: rtbfItems.length, tf1: tf1Items.length,
+      buckets: buckets.length,
+      unknownLabelsClassifiedByAI: Object.keys(newMappings),
+      totalUnknownLabels: unknownLabels.length,
+      builtAt: Date.now(),
     },
-  }), {
-    headers: { ...cors, 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=300' },
-  });
+  };
+}
+
+// ─── Refresh complet (appelé par cron + au premier démarrage) ─────────────────
+
+async function refreshAll(env: Env): Promise<void> {
+  console.log('[refresh] Démarrage refresh complet');
+
+  // Home en premier
+  try {
+    const homeData = await buildHomeData(env);
+    await env.DATA_CACHE.put(homeKey(), JSON.stringify(homeData), { expirationTtl: CACHE_TTL_STALE });
+    console.log('[refresh] home OK');
+  } catch (err) {
+    console.error('[refresh] home ERREUR:', err);
+  }
+
+  // Tous les thèmes avec liste en parallèle (par batch de 4 pour ne pas exploser)
+  const themes = [...THEMES_WITH_LIST] as ThemeKey[];
+  for (let i = 0; i < themes.length; i += 4) {
+    const batch = themes.slice(i, i + 4);
+    await Promise.allSettled(batch.map(async theme => {
+      try {
+        const data = await buildListData(theme, env);
+        await env.DATA_CACHE.put(listKey(theme), JSON.stringify(data), { expirationTtl: CACHE_TTL_STALE });
+        console.log(`[refresh] list:${theme} OK (${data.meta.total} items)`);
+      } catch (err) {
+        console.error(`[refresh] list:${theme} ERREUR:`, err);
+      }
+    }));
+  }
+  console.log('[refresh] Refresh complet terminé');
 }
 
 // ─── Handler principal ────────────────────────────────────────────────────────
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+
+  // ── Cron Trigger — tourne toutes les 3h, refresh DATA_CACHE en background ──
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(refreshAll(env));
+  },
+
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const cors = {
       'Access-Control-Allow-Origin':  '*',
@@ -1346,128 +1465,117 @@ export default {
 
     if (request.method === 'OPTIONS') return new Response(null, { headers: cors });
 
-    // ── /list ──────────────────────────────────────────────────────────────
-    if (url.pathname === '/list') {
-      try { return await handleListRequest(url, env, cors); }
-      catch (err: any) {
+    // ── /genres?theme=X — genres de TOUS les items (pas paginé) ──────────────
+    // Utilisé par ListPage pour remplir le dropdown AVANT de charger les pages
+    if (url.pathname === '/genres') {
+      const theme = url.searchParams.get('theme') as ThemeKey | null;
+      if (!theme || !(theme in THEMES)) {
+        return new Response(JSON.stringify({ error: 'theme invalide' }), {
+          status: 400, headers: { ...cors, 'Content-Type': 'application/json' },
+        });
+      }
+      try {
+        const cached = await env.DATA_CACHE.get(listKey(theme));
+        if (cached) {
+          const data = JSON.parse(cached) as { items: NormalizedItem[] };
+          // Retourner uniquement id + genres de chaque item — payload très léger
+          const genres = data.items.map(i => ({ id: i.id, genres: i.genres }));
+          return new Response(JSON.stringify({ genres }), {
+            headers: { ...cors, 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=600' },
+          });
+        }
+        return new Response(JSON.stringify({ genres: [] }), {
+          headers: { ...cors, 'Content-Type': 'application/json' },
+        });
+      } catch (err: any) {
         return new Response(JSON.stringify({ error: err.message }), {
           status: 500, headers: { ...cors, 'Content-Type': 'application/json' },
         });
       }
     }
 
-    // ── /home ──────────────────────────────────────────────────────────────
+    // ── /list?theme=X&page=N ──────────────────────────────────────────────────
+    if (url.pathname === '/list') {
+      const theme = url.searchParams.get('theme') as ThemeKey | null;
+      if (!theme || !(theme in THEMES)) {
+        return new Response(JSON.stringify({ error: 'theme invalide' }), {
+          status: 400, headers: { ...cors, 'Content-Type': 'application/json' },
+        });
+      }
+
+      try {
+        // 1. Tenter de servir depuis KV (quasi-instantané)
+        let cachedRaw = await env.DATA_CACHE.get(listKey(theme));
+
+        // 2. Cache miss (premier démarrage) → build live + cache pour les suivants
+        if (!cachedRaw) {
+          console.log(`[/list] Cache miss theme=${theme}, build live`);
+          const data = await buildListData(theme, env);
+          cachedRaw = JSON.stringify(data);
+          ctx.waitUntil(
+            env.DATA_CACHE.put(listKey(theme), cachedRaw, { expirationTtl: CACHE_TTL_STALE })
+          );
+        }
+
+        const fullData = JSON.parse(cachedRaw) as {
+          items: NormalizedItem[];
+          meta: { rtbf: number; tf1: number; total: number; builtAt: number };
+        };
+
+        // 3. Pagination
+        const PAGE_SIZE = 48;
+        const page      = Math.max(1, parseInt(url.searchParams.get('page') ?? '1', 10));
+        const start     = (page - 1) * PAGE_SIZE;
+        const pageItems = fullData.items.slice(start, start + PAGE_SIZE);
+        const totalPages = Math.ceil(fullData.items.length / PAGE_SIZE);
+
+        return new Response(JSON.stringify({
+          theme,
+          label: THEMES[theme].label,
+          emoji: THEMES[theme].emoji,
+          items: pageItems,
+          meta: {
+            ...fullData.meta,
+            page,
+            pageSize: PAGE_SIZE,
+            totalPages,
+            hasMore: page < totalPages,
+            cachedAt: fullData.meta.builtAt,
+          },
+        }), {
+          headers: {
+            ...cors,
+            'Content-Type': 'application/json',
+            // CDN cache 5 min côté navigateur, les données KV sont elles fraîches toutes les 3h
+            'Cache-Control': 'public, max-age=300',
+          },
+        });
+
+      } catch (err: any) {
+        return new Response(JSON.stringify({ error: err.message }), {
+          status: 500, headers: { ...cors, 'Content-Type': 'application/json' },
+        });
+      }
+    }
+
+    // ── /home ─────────────────────────────────────────────────────────────────
     if (url.pathname !== '/home') {
       return new Response('Not found', { status: 404, headers: cors });
     }
 
     try {
-      const [rtbfResult, tf1Result] = await Promise.allSettled([fetchRTBF(), fetchTF1()]);
-      const rtbfHome = rtbfResult.status === 'fulfilled' ? rtbfResult.value : null;
-      const tf1Raw   = tf1Result.status  === 'fulfilled' ? tf1Result.value  : null;
+      let cachedRaw = await env.DATA_CACHE.get(homeKey());
 
-      if (rtbfResult.status === 'rejected') console.error('[/home] RTBF:', rtbfResult.reason);
-      if (tf1Result.status  === 'rejected') console.error('[/home] TF1:',  tf1Result.reason);
-
-      // Promobox RTBF
-      let rtbfPromoItems: any[] = [];
-      if (rtbfHome) {
-        const promoWidget = (rtbfHome.data?.widgets ?? []).find((w: any) => w.type === 'PROMOBOX');
-        if (promoWidget?.contentPath) {
-          try {
-            const pUrl = promoWidget.contentPath.startsWith('http')
-              ? promoWidget.contentPath
-              : `https://bff-service.rtbf.be${promoWidget.contentPath}`;
-            const pRes = await fetch(pUrl, { headers: { Accept: 'application/json' } });
-            if (pRes.ok) { const pj: any = await pRes.json(); rtbfPromoItems = pj?.data?.content ?? pj?.data ?? []; }
-          } catch { /* silent */ }
-        }
+      if (!cachedRaw) {
+        console.log('[/home] Cache miss, build live');
+        const data = await buildHomeData(env);
+        cachedRaw = JSON.stringify(data);
+        ctx.waitUntil(
+          env.DATA_CACHE.put(homeKey(), cachedRaw, { expirationTtl: CACHE_TTL_STALE })
+        );
       }
 
-      const heroBanners = [
-        ...(rtbfHome ? buildRTBFBanners(rtbfHome, rtbfPromoItems) : []),
-        ...(tf1Raw   ? buildTF1Banners(tf1Raw)                    : []),
-      ];
-
-      const llmCacheRaw = await env.LABEL_CACHE.get('label_map').catch(() => null);
-      const llmCache: Record<string, ThemeKey> = llmCacheRaw ? JSON.parse(llmCacheRaw) : {};
-
-      // Widgets RTBF home (1 page chacun — suffisant pour la home)
-      let rtbfItems: NormalizedItem[] = [];
-      if (rtbfHome) {
-        const EXCL = new Set([
-          'FAVORITE_PROGRAM_LIST', 'CHANNEL_LIST', 'ONGOING_PLAY_HISTORY',
-          'CATEGORY_LIST', 'BANNER', 'MEDIA_TRAILER', 'PROMOBOX',
-        ]);
-        const wMetas = (rtbfHome.data?.widgets ?? [])
-          .filter((w: any) => !EXCL.has(w.type) && w.contentPath)
-          .map((w: any) => ({ title: w.title ?? '', fetch: fetchRTBFWidgetAll(w.contentPath, 1) }));
-
-        const res = await Promise.allSettled(wMetas.map((m: any) => m.fetch));
-        for (let i = 0; i < res.length; i++) {
-          if (res[i].status !== 'fulfilled') continue;
-          for (const raw of (res[i] as PromiseFulfilledResult<any[]>).value) {
-            const item = normalizeRTBFItem(raw, llmCache, wMetas[i].title);
-            if (item) rtbfItems.push(item);
-          }
-        }
-      }
-
-      // homeSliders TF1
-      let tf1Items: NormalizedItem[] = [];
-      if (tf1Raw) {
-        for (const slider of tf1Raw.data?.homeSliders ?? []) {
-          for (const item of slider.items ?? []) {
-            const n = normalizeTF1Item(item, llmCache);
-            if (n) tf1Items.push(n);
-          }
-        }
-      }
-
-      rtbfItems = deduplicate(rtbfItems);
-      tf1Items  = deduplicate(tf1Items);
-
-      // AI labels inconnus
-      const allForAI = [...rtbfItems, ...tf1Items];
-      const unknownLabels = [...new Set(
-        allForAI
-          .filter(i => i.theme === 'series' && i.categoryLabel)
-          .map(i => normalizeLabel(i.categoryLabel!))
-          .filter(l => !CATEGORY_MAP[l] && !llmCache[l]),
-      )];
-
-      let newMappings: Record<string, ThemeKey> = {};
-      if (unknownLabels.length > 0) {
-        newMappings = await classifyWithWorkersAI(unknownLabels, env);
-        if (Object.keys(newMappings).length > 0) {
-          await env.LABEL_CACHE.put(
-            'label_map',
-            JSON.stringify({ ...llmCache, ...newMappings }),
-            { expirationTtl: 604800 },
-          );
-          for (const item of allForAI) {
-            if (item.theme === 'series' && item.categoryLabel) {
-              const k = normalizeLabel(item.categoryLabel);
-              if (newMappings[k]) item.theme = newMappings[k];
-            }
-          }
-          rtbfItems = allForAI.filter(i => i.platform === 'RTBF');
-          tf1Items  = allForAI.filter(i => i.platform === 'TF1+');
-        }
-      }
-
-      const buckets = buildBuckets(rtbfItems, tf1Items);
-      console.log(`[/home] rtbf=${rtbfItems.length} tf1=${tf1Items.length} buckets=${buckets.length}`);
-
-      return new Response(JSON.stringify({
-        buckets, heroBanners,
-        meta: {
-          rtbf: rtbfItems.length, tf1: tf1Items.length,
-          buckets: buckets.length,
-          unknownLabelsClassifiedByAI: Object.keys(newMappings),
-          totalUnknownLabels: unknownLabels.length,
-        },
-      }), {
+      return new Response(cachedRaw, {
         headers: { ...cors, 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=300' },
       });
 
