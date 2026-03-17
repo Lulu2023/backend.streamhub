@@ -930,51 +930,52 @@ function normalizeTF1Item(
   const theme: ThemeKey = isTopProgram ? 'top'
     : resolveTheme(rawCategory || undefined, topics, typology || undefined, duration, llmCache);
 
-  // ── Images ──────────────────────────────────────────────────────────────────
-  const useLandscape = LANDSCAPE_BUCKETS.has(theme);
+  // ── Images ─────────────────────────────────────────────────────────────────
+  // TF1 : TOUJOURS portrait (2/3). Sources cherchées dans tous les emplacements.
+  // CoverOfVideo (Tricheurs, Koh-Lanta…) : images portrait dans video.program.decoration
+  // Ordre : coverSmall > portrait prog > portrait item > portrait video.prog
+  // Landscape uniquement en dernier recours si aucune source portrait trouvée.
 
-  // Sources portrait (2/3)
+  const videoProg = item.video?.program ?? null;
+
   const portraitSrc =
-    prog.decoration?.portrait?.sourcesWithScales ??
-    item.decoration?.portrait?.sourcesWithScales ??
-    item.thumbnail?.sourcesWithScales;
+    item.decoration?.coverSmall?.sourcesWithScales ??      // CoverOfProgram haute rés
+    item.coverSmall?.sourcesWithScales ??
+    prog.decoration?.portrait?.sourcesWithScales ??        // Program direct
+    item.decoration?.portrait?.sourcesWithScales ??        // item direct
+    videoProg?.decoration?.portrait?.sourcesWithScales ??  // CoverOfVideo → programme
+    item.thumbnail?.sourcesWithScales ??                   // TopProgramItem
+    prog.decoration?.coverSmall?.sourcesWithScales;
 
-  // Sources landscape (16/9)
   const landscapeSrc =
     prog.decoration?.thumbnail?.sourcesWithScales ??
     item.decoration?.thumbnail?.sourcesWithScales ??
+    videoProg?.decoration?.thumbnail?.sourcesWithScales ??
     item.image?.sourcesWithScales ??
     prog.decoration?.background?.sourcesWithScales;
 
-  // Sources coverSmall pour les CoverOfProgram (portrait haute résolution)
-  const coverSmallSrc =
-    item.decoration?.coverSmall?.sourcesWithScales ??
-    item.coverSmall?.sourcesWithScales;
+  // Portrait d'abord, landscape en dernier recours uniquement.
+  // Pour CoverOfVideo, item.illustration est souvent déjà une image portrait pré-compilée
+  // (ex: 430x660) — on la récupère en fallback quand sourcesWithScales est absent.
+  const prebuiltIllus: Record<string,string> | undefined =
+    (item.illustration && typeof item.illustration === 'object' && item.illustration.xs)
+      ? (item.illustration as Record<string,string>)
+      : undefined;
 
-  // Sources cover pour les CoverOfProgram (landscape haute résolution)
-  const coverSrc =
-    item.decoration?.cover?.sourcesWithScales ??
-    item.cover?.sourcesWithScales;
+  let illustration: Record<string,string> | undefined =
+    buildIllustration(portraitSrc ?? []) ?? prebuiltIllus ?? buildIllustration(landscapeSrc ?? []);
 
-  const portraitIllus  = buildIllustration(coverSmallSrc ?? portraitSrc  ?? []);
-  const landscapeIllus = buildIllustration(coverSrc      ?? landscapeSrc ?? []);
-
-  let illustration = useLandscape
-    ? (landscapeIllus ?? portraitIllus)
-    : (portraitIllus  ?? landscapeIllus);
-
-  // Fallback URL unique
+  // Fallback URL unique si aucune illustration construite
   if (!illustration) {
     const fallbackUrl = pickBestUrl([
       ...(portraitSrc  ?? []),
       ...(landscapeSrc ?? []),
-      ...(coverSmallSrc ?? []),
-      ...(coverSrc      ?? []),
     ]);
     if (fallbackUrl) {
       illustration = { xs: fallbackUrl, s: fallbackUrl, m: fallbackUrl, l: fallbackUrl, xl: fallbackUrl };
     }
   }
+
 
   // ── resourceType / IDs ──────────────────────────────────────────────────────
   const isVideo = item.__typename === 'Video';
@@ -1016,6 +1017,9 @@ function normalizeTF1Item(
     hasAudioDescriptions: (prog.hasDescriptionTrack?.total ?? 0) > 0,
     rating, stamp,
     ...(isFilm ? { isFilm: true } : {}),
+    // Force portrait — TF1 a toujours une image portrait disponible,
+    // et on veut une grille homogène avec RTBF qui est aussi portrait.
+    isPortrait: true,
   };
 
   return {
