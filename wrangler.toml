@@ -19,7 +19,7 @@ id = "4075fb3d1bdc42f8a94dd012dc91470f"
 # Puis remplacer l'id ci-dessous par celui retourné
 [[kv_namespaces]]
 binding = "DATA_CACHE"
-id = "REMPLACER_PAR_ID_DATA_CACHE"
+id = "6f4ca00fd81c4f6ea7fb0165f5973551"
 
 # Cron Trigger — rafraîchit les données toutes les 3h en background
 # Le worker tourne sans requête utilisateur, met à jour DATA_CACHE
