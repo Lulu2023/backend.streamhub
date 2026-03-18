@@ -110,6 +110,7 @@ const TF1_TOPICS_MAP: Record<string, ThemeKey> = {
   'actualite': 'info', 'journal televise': 'info', 'faits divers': 'info',
   'reportages': 'documentaire', 'enquete': 'documentaire', 'nature': 'documentaire',
   'histoire': 'documentaire',
+  'feuilleton': 'feuilletons', 'quotidienne': 'feuilletons', 'soap': 'feuilletons',
   'policier': 'thriller', 'thriller': 'thriller', 'suspense': 'thriller', 'crime': 'thriller',
   'action': 'films', 'aventure': 'films', 'drame': 'films', 'comedie': 'films',
   'romance': 'films', 'fantastique': 'films',
@@ -167,6 +168,9 @@ const RTBF_LIST_CONFIG: Partial<Record<ThemeKey, {
   episodes:     { type: 'category', path: 'series-35' },
   thriller:     { type: 'category', path: 'series-35' },
   telerealite:  { type: 'category', path: 'series-35' },
+  // Feuilletons RTBF : la catégorie series-35 contient des widgets "Feuilletons"
+  // et "Séries quotidiennes" — normalizeRTBFItem détecte feuilleton via widgetTitle.
+  // On complète avec les widgets culture qui contiennent aussi des feuilletons.
   feuilletons:  { type: 'category', path: 'series-35' },
 };
 
@@ -838,12 +842,19 @@ function normalizeRTBFItem(
   if (!item || item.resourceType === 'LIVE') return null;
 
   const wl = widgetTitle.toLowerCase();
-  const isKids   = wl.includes('kids') || wl.includes('enfant') || wl.includes('jeunesse');
-  const isSooner = item.resourceType === 'MEDIA_PREMIUM'
+  const isKids        = wl.includes('kids') || wl.includes('enfant') || wl.includes('jeunesse');
+  const isFeuilleton  = wl.includes('feuilleton') || wl.includes('quotidien') || wl.includes('soap');
+  const isSooner      = item.resourceType === 'MEDIA_PREMIUM'
     || (Array.isArray(item.products) && item.products.some((p: any) => p.label === 'Sooner'));
+
+  // Aussi détecter feuilletons via categoryLabel de l'item
+  const categoryNorm  = normalizeLabel(item.categoryLabel ?? '');
+  const isCatFeuilleton = categoryNorm === 'feuilleton' || categoryNorm === 'quotidienne'
+    || categoryNorm === 'soap opera' || categoryNorm.includes('feuilleton');
 
   const baseTheme = isSooner ? 'sooner'
     : isKids ? 'kids'
+    : (isFeuilleton || isCatFeuilleton) ? 'feuilletons'
     : resolveTheme(item.categoryLabel, undefined, undefined, item.duration, llmCache);
 
   const isEpisode = item.type === 'VIDEO' && item.resourceType === 'MEDIA';
@@ -931,7 +942,11 @@ function normalizeTF1Item(
   const rawCategory      = typology || (item.__typename === 'Video' ? 'Divertissement' : '');
 
   const isTopProgram = item.__typename === 'TopProgramItem';
+  const isFeuilletonTF1 = normalizeLabel(typology).includes('feuilleton')
+    || normalizeLabel(typology) === 'soap'
+    || (prog.topics ?? []).some((t: string) => normalizeLabel(t).includes('feuilleton'));
   const theme: ThemeKey = isTopProgram ? 'top'
+    : isFeuilletonTF1 ? 'feuilletons'
     : resolveTheme(rawCategory || undefined, topics, typology || undefined, duration, llmCache);
 
   // ── Images ─────────────────────────────────────────────────────────────────
@@ -1271,8 +1286,18 @@ async function buildListData(theme: ThemeKey, env: Env): Promise<{
     rtbfItems = rtbfItems.filter(i => i.theme === 'telerealite');
     tf1Items  = tf1Items.filter(i => i.theme === 'telerealite');
   } else if (theme === 'feuilletons') {
-    rtbfItems = rtbfItems.filter(i => i.theme === 'feuilletons');
+    // Filtre principal : items classifiés feuilletons par le normaliseur.
+    // Filet de sécurité : items 'series' dont le categoryLabel contient "feuilleton"
+    // (cas où widgetTitle ne suffit pas mais le label de l'item le trahit).
+    const isFeuilletonByLabel = (i: NormalizedItem) => {
+      const lbl = normalizeLabel(i.categoryLabel ?? '');
+      return lbl.includes('feuilleton') || lbl === 'quotidienne' || lbl === 'soap opera';
+    };
+    rtbfItems = rtbfItems.filter(i => i.theme === 'feuilletons' || (i.theme === 'series' && isFeuilletonByLabel(i)));
     tf1Items  = tf1Items.filter(i => i.theme === 'feuilletons');
+    // Corriger le theme des items rattrapés par le filet
+    for (const item of rtbfItems) item.theme = 'feuilletons';
+    for (const item of tf1Items)  item.theme = 'feuilletons';
   }
 
   rtbfItems = deduplicate(rtbfItems);
