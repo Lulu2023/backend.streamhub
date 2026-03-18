@@ -122,7 +122,7 @@ const THEMES: Record<ThemeKey, { label: string; emoji: string }> = {
   episodes:     { label: 'Épisodes récents',         emoji: '🎞️' },
   thriller:     { label: 'Policier & Thriller',      emoji: '🔍' },
   films:        { label: 'Films',                    emoji: '🎬' },
-  series:       { label: 'Séries',                   emoji: '📺' },
+  series:       { label: 'Séries',                   emoji: '🎬' },
   documentaire: { label: 'Documentaires',            emoji: '📽️' },
   culture:      { label: 'Culture & Divertissement', emoji: '🎭' },
   info:         { label: 'Info & Actualités',        emoji: '📰' },
@@ -152,7 +152,7 @@ const THEMES_WITH_LIST = new Set<ThemeKey>([
  * RTBF : page catégorie (multiples widgets paginés) ou widget(s) direct(s)
  */
 const RTBF_LIST_CONFIG: Partial<Record<ThemeKey, {
-  type: 'category'; path: string;
+  type: 'category'; path: string; forceTitle?: string;
 } | {
   type: 'widgets'; ids: string[]; forceTitle?: string;
 }>> = {
@@ -168,10 +168,9 @@ const RTBF_LIST_CONFIG: Partial<Record<ThemeKey, {
   episodes:     { type: 'category', path: 'series-35' },
   thriller:     { type: 'category', path: 'series-35' },
   telerealite:  { type: 'category', path: 'series-35' },
-  // Feuilletons RTBF : la catégorie series-35 contient des widgets "Feuilletons"
-  // et "Séries quotidiennes" — normalizeRTBFItem détecte feuilleton via widgetTitle.
-  // On complète avec les widgets culture qui contiennent aussi des feuilletons.
-  feuilletons:  { type: 'category', path: 'series-35' },
+  // Feuilletons RTBF : catégorie dédiée /categorie/feuilleton-238
+  // Le widgetTitle est forcé à "Feuilletons" pour que normalizeRTBFItem classe correctement
+  feuilletons:  { type: 'category', path: 'feuilleton-238', forceTitle: 'Feuilletons' },
 };
 
 /**
@@ -194,6 +193,8 @@ const TF1_LIST_CONFIG: Partial<Record<ThemeKey, { slugs: string[] }>> = {
   info:         { slugs: ['info'] },
   sport:        { slugs: ['sport'] },
   kids:         { slugs: ['jeunesse'] },
+  // feuilletons TF1 : TF1 classe ses feuilletons comme 'Série' (typology)
+  // On utilise le slug 'series' et on filtre sur les slugs de programmes connus
   feuilletons:  { slugs: ['series'] },
 };
 
@@ -684,23 +685,34 @@ async function fetchRTBFWidgetAll(contentPath: string, maxPages = 5): Promise<an
  * Fetch une page catégorie RTBF et retourne TOUS les items de tous ses widgets (paginés).
  * Ex : /categorie/films-36 → plusieurs PROGRAM_LIST et MEDIA_LIST, chacun paginé.
  */
-async function fetchRTBFCategoryAll(categoryPath: string): Promise<{ items: any[]; widgetTitle: string }[]> {
+async function fetchRTBFCategoryAll(
+  categoryPath: string,
+  forceWidgetTitle?: string,
+): Promise<{ items: any[]; widgetTitle: string }[]> {
   const url = `https://bff-service.rtbf.be/auvio/v1.23/pages/categorie/${categoryPath}?userAgent=Chrome-web-3.0`;
   const res = await fetch(url, { headers: { Accept: 'application/json' } });
   if (!res.ok) return [];
 
   const json: any = await res.json();
+  // Utiliser le titre de la page comme widgetTitle si forcé
+  // (utile pour feuilleton-238 dont les widgets s'appellent "Tous les contenus")
+  const pageTitle = forceWidgetTitle ?? json?.data?.content?.title ?? '';
+
   const EXCL = new Set([
     'FAVORITE_PROGRAM_LIST', 'CHANNEL_LIST', 'ONGOING_PLAY_HISTORY',
     'CATEGORY_LIST', 'BANNER', 'MEDIA_TRAILER', 'PROMOBOX',
   ]);
   const widgets = (json?.data?.widgets ?? []).filter((w: any) => !EXCL.has(w.type) && w.contentPath);
 
-  // Paginer chaque widget en parallèle (max 4 pages × 48 = ~192 items/widget)
+  // Paginer chaque widget en parallèle (max 6 pages × 48 = ~288 items/widget)
   const results = await Promise.allSettled(
     widgets.map((w: any) =>
-      fetchRTBFWidgetAll(w.contentPath, 4)
-        .then(items => ({ items, widgetTitle: w.title ?? '' })),
+      fetchRTBFWidgetAll(w.contentPath, 6)
+        .then(items => ({
+          items,
+          // Si forceWidgetTitle, l'utiliser — sinon le titre du widget
+          widgetTitle: pageTitle || w.title || '',
+        })),
     ),
   );
 
@@ -1241,7 +1253,7 @@ async function buildListData(theme: ThemeKey, env: Env): Promise<{
 
   const rtbfPromise: Promise<{ items: any[]; widgetTitle: string }[]> = rtbfCfg
     ? rtbfCfg.type === 'category'
-      ? fetchRTBFCategoryAll(rtbfCfg.path)
+      ? fetchRTBFCategoryAll(rtbfCfg.path, rtbfCfg.forceTitle)
       : Promise.all(
           rtbfCfg.ids.map(id =>
             fetchRTBFWidgetAll(
@@ -1286,18 +1298,22 @@ async function buildListData(theme: ThemeKey, env: Env): Promise<{
     rtbfItems = rtbfItems.filter(i => i.theme === 'telerealite');
     tf1Items  = tf1Items.filter(i => i.theme === 'telerealite');
   } else if (theme === 'feuilletons') {
-    // Filtre principal : items classifiés feuilletons par le normaliseur.
-    // Filet de sécurité : items 'series' dont le categoryLabel contient "feuilleton"
-    // (cas où widgetTitle ne suffit pas mais le label de l'item le trahit).
+    // RTBF : la catégorie feuilleton-238 contient des items avec categoryLabel="Feuilleton"
+    // → tous acceptés (theme déjà feuilletons via normalizeRTBFItem ou filet categoryLabel)
     const isFeuilletonByLabel = (i: NormalizedItem) => {
       const lbl = normalizeLabel(i.categoryLabel ?? '');
-      return lbl.includes('feuilleton') || lbl === 'quotidienne' || lbl === 'soap opera';
+      return lbl === 'feuilleton' || lbl.includes('feuilleton') || lbl === 'quotidienne';
     };
-    rtbfItems = rtbfItems.filter(i => i.theme === 'feuilletons' || (i.theme === 'series' && isFeuilletonByLabel(i)));
-    tf1Items  = tf1Items.filter(i => i.theme === 'feuilletons');
-    // Corriger le theme des items rattrapés par le filet
+    rtbfItems = rtbfItems.filter(i => i.theme === 'feuilletons' || isFeuilletonByLabel(i));
     for (const item of rtbfItems) item.theme = 'feuilletons';
-    for (const item of tf1Items)  item.theme = 'feuilletons';
+
+    // TF1 : pas de typology "Feuilleton" — on filtre par slug de programme connu
+    const TF1_SOAP_SLUGS = new Set(['ici-tout-commence', 'demain-nous-appartient', 'plus-belle-la-vie', 'un-si-grand-soleil', 'les-feux-de-lamour', 'feux-de-l-amour', 'demain-nous-appartient-les-anciennes-saisons', 'ici-tout-commence-les-anciennes-saisons', 'amour-gloire-et-beaute', 'les-mysteres-de-lamour', 'ch-teau-ventoux', 'chateau-ventoux']);
+    tf1Items = tf1Items.filter(i => {
+      const slug = i._raw?.slug ?? i._raw?.programSlug ?? '';
+      return TF1_SOAP_SLUGS.has(slug) || i.theme === 'feuilletons';
+    });
+    for (const item of tf1Items) item.theme = 'feuilletons';
   }
 
   rtbfItems = deduplicate(rtbfItems);
@@ -1375,19 +1391,45 @@ async function buildHomeData(env: Env): Promise<{
 
   let rtbfItems: NormalizedItem[] = [];
   if (rtbfHome) {
+    // Types exclus de la home (personnalisés, live, banners, navigation)
     const EXCL = new Set([
       'FAVORITE_PROGRAM_LIST', 'CHANNEL_LIST', 'ONGOING_PLAY_HISTORY',
       'CATEGORY_LIST', 'BANNER', 'MEDIA_TRAILER', 'PROMOBOX',
     ]);
-    const wMetas = (rtbfHome.data?.widgets ?? [])
-      .filter((w: any) => !EXCL.has(w.type) && w.contentPath)
-      .map((w: any) => ({ title: w.title ?? '', fetch: fetchRTBFWidgetAll(w.contentPath, 1) }));
 
-    const res = await Promise.allSettled(wMetas.map((m: any) => m.fetch));
-    for (let i = 0; i < res.length; i++) {
-      if (res[i].status !== 'fulfilled') continue;
-      for (const raw of (res[i] as PromiseFulfilledResult<any[]>).value) {
-        const item = normalizeRTBFItem(raw, llmCache, wMetas[i].title);
+    // Widgets dynamiques depuis /pages/home — aucun ID codé en dur
+    // On prend 1 page par widget (suffisant pour la home, ~48 items/widget)
+    const homeWidgets = (rtbfHome.data?.widgets ?? [])
+      .filter((w: any) => !EXCL.has(w.type) && w.contentPath)
+      .map((w: any) => ({ title: w.title ?? '', url: w.contentPath as string }));
+
+    // Feuilletons depuis leur catégorie dédiée (/categorie/feuilleton-238)
+    // On les injecte comme widget supplémentaire avec le bon widgetTitle
+    // pour que normalizeRTBFItem les classe correctement.
+    const feuilletonsPageUrl = 'https://bff-service.rtbf.be/auvio/v1.23/pages/categorie/feuilleton-238?userAgent=Chrome-web-3.0';
+    const feuilletonsExtra: { title: string; url: string }[] = [];
+    try {
+      const fpRes = await fetch(feuilletonsPageUrl, { headers: { Accept: 'application/json' } });
+      if (fpRes.ok) {
+        const fpJson: any = await fpRes.json();
+        for (const w of (fpJson?.data?.widgets ?? [])) {
+          if (w.contentPath && !EXCL.has(w.type)) {
+            feuilletonsExtra.push({ title: 'Feuilletons', url: w.contentPath });
+          }
+        }
+      }
+    } catch { /* silent — feuilletons seront dans /list si pas en home */ }
+
+    const allWidgets = [...homeWidgets, ...feuilletonsExtra];
+
+    const results = await Promise.allSettled(
+      allWidgets.map(w => fetchRTBFWidgetAll(w.url, 1))
+    );
+
+    for (let i = 0; i < results.length; i++) {
+      if (results[i].status !== 'fulfilled') continue;
+      for (const raw of (results[i] as PromiseFulfilledResult<any[]>).value) {
+        const item = normalizeRTBFItem(raw, llmCache, allWidgets[i].title);
         if (item) rtbfItems.push(item);
       }
     }
