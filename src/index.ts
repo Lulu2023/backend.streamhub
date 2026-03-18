@@ -32,7 +32,7 @@ const CACHE_TTL_STALE = 24 * 60 * 60;
 
 type ThemeKey =
   | 'top' | 'sooner' | 'episodes' | 'thriller' | 'films' | 'series'
-  | 'documentaire' | 'culture' | 'info' | 'sport' | 'kids' | 'telerealite';
+  | 'documentaire' | 'culture' | 'info' | 'sport' | 'kids' | 'telerealite' | 'feuilletons';
 
 interface NormalizedItem {
   id: string;
@@ -96,7 +96,7 @@ const CATEGORY_MAP: Record<string, ThemeKey> = {
   'rugby': 'sport', 'formule 1': 'sport', 'athletisme': 'sport', 'moteurs': 'sport',
   'basket': 'sport', 'natation': 'sport', 'f1': 'sport', 'moto': 'sport',
   'golf': 'sport', 'boxe': 'sport',
-  'serie': 'series', 'sitcom': 'series', 'feuilleton': 'series', 'mini serie': 'series',
+  'serie': 'series', 'sitcom': 'series', 'feuilleton': 'feuilletons', 'mini serie': 'series',
 };
 
 const TF1_TOPICS_MAP: Record<string, ThemeKey> = {
@@ -128,10 +128,11 @@ const THEMES: Record<ThemeKey, { label: string; emoji: string }> = {
   sport:        { label: 'Sport',                    emoji: '⚽' },
   kids:         { label: 'Kids',                     emoji: '🌟' },
   telerealite:  { label: 'Téléréalité',              emoji: '🎪' },
+  feuilletons:  { label: 'Feuilletons',              emoji: '📺' },
 };
 
 const BUCKET_ORDER: ThemeKey[] = [
-  'top', 'episodes', 'thriller', 'films', 'series', 'telerealite',
+  'top', 'episodes', 'feuilletons', 'thriller', 'films', 'series', 'telerealite',
   'documentaire', 'culture', 'info', 'sport', 'kids', 'sooner',
 ];
 
@@ -140,7 +141,7 @@ const LANDSCAPE_BUCKETS = new Set<ThemeKey>([
 ]);
 
 const THEMES_WITH_LIST = new Set<ThemeKey>([
-  'films', 'series', 'documentaire', 'culture', 'info', 'sport',
+  'films', 'series', 'feuilletons', 'documentaire', 'culture', 'info', 'sport',
   'kids', 'sooner', 'telerealite', 'thriller', 'episodes',
 ]);
 
@@ -166,6 +167,7 @@ const RTBF_LIST_CONFIG: Partial<Record<ThemeKey, {
   episodes:     { type: 'category', path: 'series-35' },
   thriller:     { type: 'category', path: 'series-35' },
   telerealite:  { type: 'category', path: 'series-35' },
+  feuilletons:  { type: 'category', path: 'series-35' },
 };
 
 /**
@@ -188,6 +190,7 @@ const TF1_LIST_CONFIG: Partial<Record<ThemeKey, { slugs: string[] }>> = {
   info:         { slugs: ['info'] },
   sport:        { slugs: ['sport'] },
   kids:         { slugs: ['jeunesse'] },
+  feuilletons:  { slugs: ['series'] },
 };
 
 // ─── Endpoints TF1 ───────────────────────────────────────────────────────────
@@ -321,6 +324,7 @@ const GENRE_MAP: Record<string, string> = {
   'serie': 'Série',
   'sitcom': 'Sitcom',
   'feuilleton': 'Feuilleton',
+  'soap opera': 'Feuilleton',
   'mini serie': 'Mini-série',
 };
 
@@ -843,7 +847,7 @@ function normalizeRTBFItem(
     : resolveTheme(item.categoryLabel, undefined, undefined, item.duration, llmCache);
 
   const isEpisode = item.type === 'VIDEO' && item.resourceType === 'MEDIA';
-  const episodeBuckets = new Set<ThemeKey>(['series', 'films', 'thriller', 'telerealite']);
+  const episodeBuckets = new Set<ThemeKey>(['series', 'feuilletons', 'films', 'thriller', 'telerealite']);
   const theme = (isEpisode && episodeBuckets.has(baseTheme)) ? 'episodes' : baseTheme;
 
   return {
@@ -1266,6 +1270,9 @@ async function buildListData(theme: ThemeKey, env: Env): Promise<{
   } else if (theme === 'telerealite') {
     rtbfItems = rtbfItems.filter(i => i.theme === 'telerealite');
     tf1Items  = tf1Items.filter(i => i.theme === 'telerealite');
+  } else if (theme === 'feuilletons') {
+    rtbfItems = rtbfItems.filter(i => i.theme === 'feuilletons');
+    tf1Items  = tf1Items.filter(i => i.theme === 'feuilletons');
   }
 
   rtbfItems = deduplicate(rtbfItems);
