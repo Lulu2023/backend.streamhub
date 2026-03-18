@@ -32,7 +32,7 @@ const CACHE_TTL_STALE = 24 * 60 * 60;
 
 type ThemeKey =
   | 'top' | 'sooner' | 'episodes' | 'thriller' | 'films' | 'series'
-  | 'documentaire' | 'culture' | 'info' | 'sport' | 'kids' | 'telerealite' | 'feuilletons';
+  | 'documentaire' | 'culture' | 'info' | 'sport' | 'kids' | 'telerealite';
 
 interface NormalizedItem {
   id: string;
@@ -63,18 +63,6 @@ interface ThematicBucket {
   emoji: string;
   items: NormalizedItem[];
   hasMore: boolean;
-  /** Ratio forcé pour toutes les cards du bucket — garantit une grille homogène */
-  forceRatio: 'portrait' | 'landscape';
-}
-
-/** Sépare un tableau d'items en deux groupes : programs (portrait) et médias (landscape) */
-function splitByResourceType(items: NormalizedItem[]): {
-  programs: NormalizedItem[];
-  medias: NormalizedItem[];
-} {
-  const programs = items.filter(i => i.resourceType === 'PROGRAM');
-  const medias   = items.filter(i => i.resourceType === 'MEDIA' || i.resourceType === 'MEDIA_PREMIUM');
-  return { programs, medias };
 }
 
 // ─── Maps de classification ───────────────────────────────────────────────────
@@ -108,7 +96,7 @@ const CATEGORY_MAP: Record<string, ThemeKey> = {
   'rugby': 'sport', 'formule 1': 'sport', 'athletisme': 'sport', 'moteurs': 'sport',
   'basket': 'sport', 'natation': 'sport', 'f1': 'sport', 'moto': 'sport',
   'golf': 'sport', 'boxe': 'sport',
-  'serie': 'series', 'sitcom': 'series', 'feuilleton': 'feuilletons', 'mini serie': 'series',
+  'serie': 'series', 'sitcom': 'series', 'feuilleton': 'series', 'mini serie': 'series',
 };
 
 const TF1_TOPICS_MAP: Record<string, ThemeKey> = {
@@ -122,7 +110,6 @@ const TF1_TOPICS_MAP: Record<string, ThemeKey> = {
   'actualite': 'info', 'journal televise': 'info', 'faits divers': 'info',
   'reportages': 'documentaire', 'enquete': 'documentaire', 'nature': 'documentaire',
   'histoire': 'documentaire',
-  'feuilleton': 'feuilletons', 'quotidienne': 'feuilletons', 'soap': 'feuilletons',
   'policier': 'thriller', 'thriller': 'thriller', 'suspense': 'thriller', 'crime': 'thriller',
   'action': 'films', 'aventure': 'films', 'drame': 'films', 'comedie': 'films',
   'romance': 'films', 'fantastique': 'films',
@@ -134,45 +121,26 @@ const THEMES: Record<ThemeKey, { label: string; emoji: string }> = {
   episodes:     { label: 'Épisodes récents',         emoji: '🎞️' },
   thriller:     { label: 'Policier & Thriller',      emoji: '🔍' },
   films:        { label: 'Films',                    emoji: '🎬' },
-  series:       { label: 'Séries',                   emoji: '🎬' },
+  series:       { label: 'Séries',                   emoji: '📺' },
   documentaire: { label: 'Documentaires',            emoji: '📽️' },
   culture:      { label: 'Culture & Divertissement', emoji: '🎭' },
   info:         { label: 'Info & Actualités',        emoji: '📰' },
   sport:        { label: 'Sport',                    emoji: '⚽' },
   kids:         { label: 'Kids',                     emoji: '🌟' },
   telerealite:  { label: 'Téléréalité',              emoji: '🎪' },
-  feuilletons:  { label: 'Feuilletons',              emoji: '📺' },
 };
 
 const BUCKET_ORDER: ThemeKey[] = [
-  'top', 'episodes', 'feuilletons', 'thriller', 'films', 'series', 'telerealite',
+  'top', 'episodes', 'thriller', 'films', 'series', 'telerealite',
   'documentaire', 'culture', 'info', 'sport', 'kids', 'sooner',
 ];
 
 const LANDSCAPE_BUCKETS = new Set<ThemeKey>([
-  'episodes', 'documentaire', 'culture', 'info', 'sport',
+  'episodes', 'thriller', 'documentaire', 'culture', 'info', 'sport',
 ]);
 
-// Ratio forcé par thème — détermine l'aspect ratio de TOUTES les cards du bucket
-// Portrait = 2/3 (affiches), Landscape = 16/9 (vignettes épisodes/docs)
-const BUCKET_RATIO: Record<ThemeKey, 'portrait' | 'landscape'> = {
-  top:          'portrait',
-  sooner:       'portrait',
-  episodes:     'landscape',
-  thriller:     'portrait',
-  films:        'portrait',
-  series:       'portrait',
-  feuilletons:  'portrait',
-  documentaire: 'landscape',
-  culture:      'landscape',
-  info:         'landscape',
-  sport:        'landscape',
-  kids:         'portrait',
-  telerealite:  'portrait',
-};
-
 const THEMES_WITH_LIST = new Set<ThemeKey>([
-  'films', 'series', 'feuilletons', 'documentaire', 'culture', 'info', 'sport',
+  'films', 'series', 'documentaire', 'culture', 'info', 'sport',
   'kids', 'sooner', 'telerealite', 'thriller', 'episodes',
 ]);
 
@@ -182,7 +150,7 @@ const THEMES_WITH_LIST = new Set<ThemeKey>([
  * RTBF : page catégorie (multiples widgets paginés) ou widget(s) direct(s)
  */
 const RTBF_LIST_CONFIG: Partial<Record<ThemeKey, {
-  type: 'category'; path: string; forceTitle?: string;
+  type: 'category'; path: string;
 } | {
   type: 'widgets'; ids: string[]; forceTitle?: string;
 }>> = {
@@ -198,10 +166,6 @@ const RTBF_LIST_CONFIG: Partial<Record<ThemeKey, {
   episodes:     { type: 'category', path: 'series-35' },
   thriller:     { type: 'category', path: 'series-35' },
   telerealite:  { type: 'category', path: 'series-35' },
-  // Feuilletons RTBF : catégorie dédiée /categorie/feuilleton-238
-  // Le widgetTitle est forcé à "Feuilletons" pour que normalizeRTBFItem classe correctement
-  // Feuilletons RTBF : dans series-35, filtrés par categoryLabel="Feuilleton" post-normalisation
-  feuilletons:  { type: 'category', path: 'series-35' },
 };
 
 /**
@@ -224,9 +188,6 @@ const TF1_LIST_CONFIG: Partial<Record<ThemeKey, { slugs: string[] }>> = {
   info:         { slugs: ['info'] },
   sport:        { slugs: ['sport'] },
   kids:         { slugs: ['jeunesse'] },
-  // feuilletons TF1 : TF1 classe ses feuilletons comme 'Série' (typology)
-  // On utilise le slug 'series' et on filtre sur les slugs de programmes connus
-  feuilletons:  { slugs: ['series'] },
 };
 
 // ─── Endpoints TF1 ───────────────────────────────────────────────────────────
@@ -360,7 +321,6 @@ const GENRE_MAP: Record<string, string> = {
   'serie': 'Série',
   'sitcom': 'Sitcom',
   'feuilleton': 'Feuilleton',
-  'soap opera': 'Feuilleton',
   'mini serie': 'Mini-série',
 };
 
@@ -716,34 +676,23 @@ async function fetchRTBFWidgetAll(contentPath: string, maxPages = 5): Promise<an
  * Fetch une page catégorie RTBF et retourne TOUS les items de tous ses widgets (paginés).
  * Ex : /categorie/films-36 → plusieurs PROGRAM_LIST et MEDIA_LIST, chacun paginé.
  */
-async function fetchRTBFCategoryAll(
-  categoryPath: string,
-  forceWidgetTitle?: string,
-): Promise<{ items: any[]; widgetTitle: string }[]> {
+async function fetchRTBFCategoryAll(categoryPath: string): Promise<{ items: any[]; widgetTitle: string }[]> {
   const url = `https://bff-service.rtbf.be/auvio/v1.23/pages/categorie/${categoryPath}?userAgent=Chrome-web-3.0`;
   const res = await fetch(url, { headers: { Accept: 'application/json' } });
   if (!res.ok) return [];
 
   const json: any = await res.json();
-  // Utiliser le titre de la page comme widgetTitle si forcé
-  // (utile pour feuilleton-238 dont les widgets s'appellent "Tous les contenus")
-  const pageTitle = forceWidgetTitle ?? json?.data?.content?.title ?? '';
-
   const EXCL = new Set([
     'FAVORITE_PROGRAM_LIST', 'CHANNEL_LIST', 'ONGOING_PLAY_HISTORY',
     'CATEGORY_LIST', 'BANNER', 'MEDIA_TRAILER', 'PROMOBOX',
   ]);
   const widgets = (json?.data?.widgets ?? []).filter((w: any) => !EXCL.has(w.type) && w.contentPath);
 
-  // Paginer chaque widget en parallèle (max 6 pages × 48 = ~288 items/widget)
+  // Paginer chaque widget en parallèle (max 4 pages × 48 = ~192 items/widget)
   const results = await Promise.allSettled(
     widgets.map((w: any) =>
-      fetchRTBFWidgetAll(w.contentPath, 6)
-        .then(items => ({
-          items,
-          // Si forceWidgetTitle, l'utiliser — sinon le titre du widget
-          widgetTitle: pageTitle || w.title || '',
-        })),
+      fetchRTBFWidgetAll(w.contentPath, 4)
+        .then(items => ({ items, widgetTitle: w.title ?? '' })),
     ),
   );
 
@@ -885,23 +834,16 @@ function normalizeRTBFItem(
   if (!item || item.resourceType === 'LIVE') return null;
 
   const wl = widgetTitle.toLowerCase();
-  const isKids        = wl.includes('kids') || wl.includes('enfant') || wl.includes('jeunesse');
-  const isFeuilleton  = wl.includes('feuilleton') || wl.includes('quotidien') || wl.includes('soap');
-  const isSooner      = item.resourceType === 'MEDIA_PREMIUM'
+  const isKids   = wl.includes('kids') || wl.includes('enfant') || wl.includes('jeunesse');
+  const isSooner = item.resourceType === 'MEDIA_PREMIUM'
     || (Array.isArray(item.products) && item.products.some((p: any) => p.label === 'Sooner'));
-
-  // Aussi détecter feuilletons via categoryLabel de l'item
-  const categoryNorm  = normalizeLabel(item.categoryLabel ?? '');
-  const isCatFeuilleton = categoryNorm === 'feuilleton' || categoryNorm === 'quotidienne'
-    || categoryNorm === 'soap opera' || categoryNorm.includes('feuilleton');
 
   const baseTheme = isSooner ? 'sooner'
     : isKids ? 'kids'
-    : (isFeuilleton || isCatFeuilleton) ? 'feuilletons'
     : resolveTheme(item.categoryLabel, undefined, undefined, item.duration, llmCache);
 
   const isEpisode = item.type === 'VIDEO' && item.resourceType === 'MEDIA';
-  const episodeBuckets = new Set<ThemeKey>(['series', 'feuilletons', 'films', 'thriller', 'telerealite']);
+  const episodeBuckets = new Set<ThemeKey>(['series', 'films', 'thriller', 'telerealite']);
   const theme = (isEpisode && episodeBuckets.has(baseTheme)) ? 'episodes' : baseTheme;
 
   return {
@@ -985,11 +927,7 @@ function normalizeTF1Item(
   const rawCategory      = typology || (item.__typename === 'Video' ? 'Divertissement' : '');
 
   const isTopProgram = item.__typename === 'TopProgramItem';
-  const isFeuilletonTF1 = normalizeLabel(typology).includes('feuilleton')
-    || normalizeLabel(typology) === 'soap'
-    || (prog.topics ?? []).some((t: string) => normalizeLabel(t).includes('feuilleton'));
   const theme: ThemeKey = isTopProgram ? 'top'
-    : isFeuilletonTF1 ? 'feuilletons'
     : resolveTheme(rawCategory || undefined, topics, typology || undefined, duration, llmCache);
 
   // ── Images ─────────────────────────────────────────────────────────────────
@@ -1128,56 +1066,19 @@ function buildBuckets(
   for (const i of rtbfItems) (rG.get(i.theme) ?? rG.set(i.theme, []).get(i.theme)!).push(i);
   for (const i of tf1Items)  (tG.get(i.theme) ?? tG.set(i.theme, []).get(i.theme)!).push(i);
 
-  const buckets: ThematicBucket[] = [];
-
-  for (const theme of BUCKET_ORDER) {
-    const rtbf = rG.get(theme) ?? [];
-    const tf1  = tG.get(theme) ?? [];
-
-    // Interleave RTBF + TF1
+  return BUCKET_ORDER.map(theme => {
+    const rtbf = rG.get(theme) ?? [], tf1 = tG.get(theme) ?? [];
     const merged: NormalizedItem[] = [];
     let r = 0, t = 0;
     while (r < rtbf.length || t < tf1.length) {
       if (r < rtbf.length) merged.push(rtbf[r++]);
       if (t < tf1.length)  merged.push(tf1[t++]);
     }
-    if (!merged.length) continue;
-
-    const declaredRatio = BUCKET_RATIO[theme] ?? 'portrait';
-
-    // Séparer programs (portrait) et médias (landscape) si le bucket est mixte.
-    // Un bucket "episodes" est toujours landscape (médias). Les autres sont portrait (programs).
-    // Si tous les items sont du même type → un seul bucket.
-    // Si mixte → deux sous-buckets : programs d'abord, médias ensuite.
-    const { programs, medias } = splitByResourceType(merged);
-    const hasBoth = programs.length > 0 && medias.length > 0;
-
-    if (!hasBoth) {
-      // Tout homogène — forceRatio selon le type majoritaire
-      const ratio: 'portrait' | 'landscape' = medias.length > programs.length ? 'landscape' : declaredRatio;
-      buckets.push({
-        theme, label: THEMES[theme].label, emoji: THEMES[theme].emoji,
-        items: merged, hasMore: THEMES_WITH_LIST.has(theme),
-        forceRatio: ratio,
-      });
-    } else {
-      // Mixte — bucket programs (portrait) puis bucket médias (landscape)
-      buckets.push({
-        theme, label: THEMES[theme].label, emoji: THEMES[theme].emoji,
-        items: programs, hasMore: THEMES_WITH_LIST.has(theme),
-        forceRatio: 'portrait',
-      });
-      buckets.push({
-        theme: `${theme}` as ThemeKey,
-        label: `${THEMES[theme].label} — Épisodes`,
-        emoji: '🎞️',
-        items: medias, hasMore: false,
-        forceRatio: 'landscape',
-      });
-    }
-  }
-
-  return buckets;
+    return {
+      theme, label: THEMES[theme].label, emoji: THEMES[theme].emoji,
+      items: merged, hasMore: THEMES_WITH_LIST.has(theme),
+    };
+  }).filter(b => b.items.length > 0);
 }
 
 // ─── Banners ──────────────────────────────────────────────────────────────────
@@ -1321,7 +1222,7 @@ async function buildListData(theme: ThemeKey, env: Env): Promise<{
 
   const rtbfPromise: Promise<{ items: any[]; widgetTitle: string }[]> = rtbfCfg
     ? rtbfCfg.type === 'category'
-      ? fetchRTBFCategoryAll(rtbfCfg.path, rtbfCfg.forceTitle)
+      ? fetchRTBFCategoryAll(rtbfCfg.path)
       : Promise.all(
           rtbfCfg.ids.map(id =>
             fetchRTBFWidgetAll(
@@ -1365,23 +1266,6 @@ async function buildListData(theme: ThemeKey, env: Env): Promise<{
   } else if (theme === 'telerealite') {
     rtbfItems = rtbfItems.filter(i => i.theme === 'telerealite');
     tf1Items  = tf1Items.filter(i => i.theme === 'telerealite');
-  } else if (theme === 'feuilletons') {
-    // RTBF : la catégorie feuilleton-238 contient des items avec categoryLabel="Feuilleton"
-    // → tous acceptés (theme déjà feuilletons via normalizeRTBFItem ou filet categoryLabel)
-    const isFeuilletonByLabel = (i: NormalizedItem) => {
-      const lbl = normalizeLabel(i.categoryLabel ?? '');
-      return lbl === 'feuilleton' || lbl.includes('feuilleton') || lbl === 'quotidienne';
-    };
-    rtbfItems = rtbfItems.filter(i => i.theme === 'feuilletons' || isFeuilletonByLabel(i));
-    for (const item of rtbfItems) item.theme = 'feuilletons';
-
-    // TF1 : pas de typology "Feuilleton" — on filtre par slug de programme connu
-    const TF1_SOAP_SLUGS = new Set(['ici-tout-commence', 'demain-nous-appartient', 'plus-belle-la-vie', 'un-si-grand-soleil', 'les-feux-de-lamour', 'feux-de-l-amour', 'demain-nous-appartient-les-anciennes-saisons', 'ici-tout-commence-les-anciennes-saisons', 'amour-gloire-et-beaute', 'les-mysteres-de-lamour', 'ch-teau-ventoux', 'chateau-ventoux']);
-    tf1Items = tf1Items.filter(i => {
-      const slug = i._raw?.slug ?? i._raw?.programSlug ?? '';
-      return TF1_SOAP_SLUGS.has(slug) || i.theme === 'feuilletons';
-    });
-    for (const item of tf1Items) item.theme = 'feuilletons';
   }
 
   rtbfItems = deduplicate(rtbfItems);
@@ -1459,49 +1343,19 @@ async function buildHomeData(env: Env): Promise<{
 
   let rtbfItems: NormalizedItem[] = [];
   if (rtbfHome) {
-    // Types exclus de la home (personnalisés, live, banners, navigation)
     const EXCL = new Set([
       'FAVORITE_PROGRAM_LIST', 'CHANNEL_LIST', 'ONGOING_PLAY_HISTORY',
       'CATEGORY_LIST', 'BANNER', 'MEDIA_TRAILER', 'PROMOBOX',
     ]);
-
-    // Widgets dynamiques depuis /pages/home — aucun ID codé en dur
-    // On prend 1 page par widget (suffisant pour la home, ~48 items/widget)
-    const homeWidgets = (rtbfHome.data?.widgets ?? [])
+    const wMetas = (rtbfHome.data?.widgets ?? [])
       .filter((w: any) => !EXCL.has(w.type) && w.contentPath)
-      .map((w: any) => ({ title: w.title ?? '', url: w.contentPath as string }));
+      .map((w: any) => ({ title: w.title ?? '', fetch: fetchRTBFWidgetAll(w.contentPath, 1) }));
 
-    // Enrichissement feuilletons : on fetche series-35 et on injecte les items
-    // avec widgetTitle='Feuilletons' pour que normalizeRTBFItem les classe correctement.
-    // Ces items viennent en complément des widgets home RTBF normaux.
-    const feuilletonsWidgets: { title: string; url: string }[] = [];
-    try {
-      const fRes = await fetch(
-        'https://bff-service.rtbf.be/auvio/v1.23/pages/categorie/series-35?userAgent=Chrome-web-3.0',
-        { headers: { Accept: 'application/json' } },
-      );
-      if (fRes.ok) {
-        const fJson: any = await fRes.json();
-        for (const w of (fJson?.data?.widgets ?? [])) {
-          const wTitle: string = (w.title ?? '').toLowerCase();
-          if (w.contentPath && !EXCL.has(w.type) &&
-              (wTitle.includes('feuilleton') || wTitle.includes('quotidien') || wTitle.includes('soap'))) {
-            feuilletonsWidgets.push({ title: 'Feuilletons', url: w.contentPath });
-          }
-        }
-      }
-    } catch { /* silent */ }
-
-    const allWidgets = [...homeWidgets, ...feuilletonsWidgets];
-
-    const results = await Promise.allSettled(
-      allWidgets.map(w => fetchRTBFWidgetAll(w.url, 1))
-    );
-
-    for (let i = 0; i < results.length; i++) {
-      if (results[i].status !== 'fulfilled') continue;
-      for (const raw of (results[i] as PromiseFulfilledResult<any[]>).value) {
-        const item = normalizeRTBFItem(raw, llmCache, allWidgets[i].title);
+    const res = await Promise.allSettled(wMetas.map((m: any) => m.fetch));
+    for (let i = 0; i < res.length; i++) {
+      if (res[i].status !== 'fulfilled') continue;
+      for (const raw of (res[i] as PromiseFulfilledResult<any[]>).value) {
+        const item = normalizeRTBFItem(raw, llmCache, wMetas[i].title);
         if (item) rtbfItems.push(item);
       }
     }
@@ -1510,11 +1364,8 @@ async function buildHomeData(env: Env): Promise<{
   let tf1Items: NormalizedItem[] = [];
   if (tf1Raw) {
     for (const slider of tf1Raw.data?.homeSliders ?? []) {
-      const sliderTitle: string = slider.title ?? slider.decoration?.label ?? '';
       for (const item of slider.items ?? []) {
-        // Injecter _sliderTitle comme pour fetchTF1CategorySliders
-        // → normalizeTF1Item peut détecter feuilletons via le titre du slider
-        const n = normalizeTF1Item({ ...item, _sliderTitle: sliderTitle }, llmCache);
+        const n = normalizeTF1Item(item, llmCache);
         if (n) tf1Items.push(n);
       }
     }
