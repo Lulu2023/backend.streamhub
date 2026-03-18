@@ -63,6 +63,18 @@ interface ThematicBucket {
   emoji: string;
   items: NormalizedItem[];
   hasMore: boolean;
+  /** Ratio forcé pour toutes les cards du bucket — garantit une grille homogène */
+  forceRatio: 'portrait' | 'landscape';
+}
+
+/** Sépare un tableau d'items en deux groupes : programs (portrait) et médias (landscape) */
+function splitByResourceType(items: NormalizedItem[]): {
+  programs: NormalizedItem[];
+  medias: NormalizedItem[];
+} {
+  const programs = items.filter(i => i.resourceType === 'PROGRAM');
+  const medias   = items.filter(i => i.resourceType === 'MEDIA' || i.resourceType === 'MEDIA_PREMIUM');
+  return { programs, medias };
 }
 
 // ─── Maps de classification ───────────────────────────────────────────────────
@@ -138,8 +150,26 @@ const BUCKET_ORDER: ThemeKey[] = [
 ];
 
 const LANDSCAPE_BUCKETS = new Set<ThemeKey>([
-  'episodes', 'thriller', 'documentaire', 'culture', 'info', 'sport',
+  'episodes', 'documentaire', 'culture', 'info', 'sport',
 ]);
+
+// Ratio forcé par thème — détermine l'aspect ratio de TOUTES les cards du bucket
+// Portrait = 2/3 (affiches), Landscape = 16/9 (vignettes épisodes/docs)
+const BUCKET_RATIO: Record<ThemeKey, 'portrait' | 'landscape'> = {
+  top:          'portrait',
+  sooner:       'portrait',
+  episodes:     'landscape',
+  thriller:     'portrait',
+  films:        'portrait',
+  series:       'portrait',
+  feuilletons:  'portrait',
+  documentaire: 'landscape',
+  culture:      'landscape',
+  info:         'landscape',
+  sport:        'landscape',
+  kids:         'portrait',
+  telerealite:  'portrait',
+};
 
 const THEMES_WITH_LIST = new Set<ThemeKey>([
   'films', 'series', 'feuilletons', 'documentaire', 'culture', 'info', 'sport',
@@ -170,7 +200,8 @@ const RTBF_LIST_CONFIG: Partial<Record<ThemeKey, {
   telerealite:  { type: 'category', path: 'series-35' },
   // Feuilletons RTBF : catégorie dédiée /categorie/feuilleton-238
   // Le widgetTitle est forcé à "Feuilletons" pour que normalizeRTBFItem classe correctement
-  feuilletons:  { type: 'category', path: 'feuilleton-238', forceTitle: 'Feuilletons' },
+  // Feuilletons RTBF : dans series-35, filtrés par categoryLabel="Feuilleton" post-normalisation
+  feuilletons:  { type: 'category', path: 'series-35' },
 };
 
 /**
@@ -1097,19 +1128,56 @@ function buildBuckets(
   for (const i of rtbfItems) (rG.get(i.theme) ?? rG.set(i.theme, []).get(i.theme)!).push(i);
   for (const i of tf1Items)  (tG.get(i.theme) ?? tG.set(i.theme, []).get(i.theme)!).push(i);
 
-  return BUCKET_ORDER.map(theme => {
-    const rtbf = rG.get(theme) ?? [], tf1 = tG.get(theme) ?? [];
+  const buckets: ThematicBucket[] = [];
+
+  for (const theme of BUCKET_ORDER) {
+    const rtbf = rG.get(theme) ?? [];
+    const tf1  = tG.get(theme) ?? [];
+
+    // Interleave RTBF + TF1
     const merged: NormalizedItem[] = [];
     let r = 0, t = 0;
     while (r < rtbf.length || t < tf1.length) {
       if (r < rtbf.length) merged.push(rtbf[r++]);
       if (t < tf1.length)  merged.push(tf1[t++]);
     }
-    return {
-      theme, label: THEMES[theme].label, emoji: THEMES[theme].emoji,
-      items: merged, hasMore: THEMES_WITH_LIST.has(theme),
-    };
-  }).filter(b => b.items.length > 0);
+    if (!merged.length) continue;
+
+    const declaredRatio = BUCKET_RATIO[theme] ?? 'portrait';
+
+    // Séparer programs (portrait) et médias (landscape) si le bucket est mixte.
+    // Un bucket "episodes" est toujours landscape (médias). Les autres sont portrait (programs).
+    // Si tous les items sont du même type → un seul bucket.
+    // Si mixte → deux sous-buckets : programs d'abord, médias ensuite.
+    const { programs, medias } = splitByResourceType(merged);
+    const hasBoth = programs.length > 0 && medias.length > 0;
+
+    if (!hasBoth) {
+      // Tout homogène — forceRatio selon le type majoritaire
+      const ratio: 'portrait' | 'landscape' = medias.length > programs.length ? 'landscape' : declaredRatio;
+      buckets.push({
+        theme, label: THEMES[theme].label, emoji: THEMES[theme].emoji,
+        items: merged, hasMore: THEMES_WITH_LIST.has(theme),
+        forceRatio: ratio,
+      });
+    } else {
+      // Mixte — bucket programs (portrait) puis bucket médias (landscape)
+      buckets.push({
+        theme, label: THEMES[theme].label, emoji: THEMES[theme].emoji,
+        items: programs, hasMore: THEMES_WITH_LIST.has(theme),
+        forceRatio: 'portrait',
+      });
+      buckets.push({
+        theme: `${theme}` as ThemeKey,
+        label: `${THEMES[theme].label} — Épisodes`,
+        emoji: '🎞️',
+        items: medias, hasMore: false,
+        forceRatio: 'landscape',
+      });
+    }
+  }
+
+  return buckets;
 }
 
 // ─── Banners ──────────────────────────────────────────────────────────────────
@@ -1403,24 +1471,28 @@ async function buildHomeData(env: Env): Promise<{
       .filter((w: any) => !EXCL.has(w.type) && w.contentPath)
       .map((w: any) => ({ title: w.title ?? '', url: w.contentPath as string }));
 
-    // Feuilletons depuis leur catégorie dédiée (/categorie/feuilleton-238)
-    // On les injecte comme widget supplémentaire avec le bon widgetTitle
-    // pour que normalizeRTBFItem les classe correctement.
-    const feuilletonsPageUrl = 'https://bff-service.rtbf.be/auvio/v1.23/pages/categorie/feuilleton-238?userAgent=Chrome-web-3.0';
-    const feuilletonsExtra: { title: string; url: string }[] = [];
+    // Enrichissement feuilletons : on fetche series-35 et on injecte les items
+    // avec widgetTitle='Feuilletons' pour que normalizeRTBFItem les classe correctement.
+    // Ces items viennent en complément des widgets home RTBF normaux.
+    const feuilletonsWidgets: { title: string; url: string }[] = [];
     try {
-      const fpRes = await fetch(feuilletonsPageUrl, { headers: { Accept: 'application/json' } });
-      if (fpRes.ok) {
-        const fpJson: any = await fpRes.json();
-        for (const w of (fpJson?.data?.widgets ?? [])) {
-          if (w.contentPath && !EXCL.has(w.type)) {
-            feuilletonsExtra.push({ title: 'Feuilletons', url: w.contentPath });
+      const fRes = await fetch(
+        'https://bff-service.rtbf.be/auvio/v1.23/pages/categorie/series-35?userAgent=Chrome-web-3.0',
+        { headers: { Accept: 'application/json' } },
+      );
+      if (fRes.ok) {
+        const fJson: any = await fRes.json();
+        for (const w of (fJson?.data?.widgets ?? [])) {
+          const wTitle: string = (w.title ?? '').toLowerCase();
+          if (w.contentPath && !EXCL.has(w.type) &&
+              (wTitle.includes('feuilleton') || wTitle.includes('quotidien') || wTitle.includes('soap'))) {
+            feuilletonsWidgets.push({ title: 'Feuilletons', url: w.contentPath });
           }
         }
       }
-    } catch { /* silent — feuilletons seront dans /list si pas en home */ }
+    } catch { /* silent */ }
 
-    const allWidgets = [...homeWidgets, ...feuilletonsExtra];
+    const allWidgets = [...homeWidgets, ...feuilletonsWidgets];
 
     const results = await Promise.allSettled(
       allWidgets.map(w => fetchRTBFWidgetAll(w.url, 1))
@@ -1438,8 +1510,11 @@ async function buildHomeData(env: Env): Promise<{
   let tf1Items: NormalizedItem[] = [];
   if (tf1Raw) {
     for (const slider of tf1Raw.data?.homeSliders ?? []) {
+      const sliderTitle: string = slider.title ?? slider.decoration?.label ?? '';
       for (const item of slider.items ?? []) {
-        const n = normalizeTF1Item(item, llmCache);
+        // Injecter _sliderTitle comme pour fetchTF1CategorySliders
+        // → normalizeTF1Item peut détecter feuilletons via le titre du slider
+        const n = normalizeTF1Item({ ...item, _sliderTitle: sliderTitle }, llmCache);
         if (n) tf1Items.push(n);
       }
     }
