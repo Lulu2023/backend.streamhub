@@ -1,22 +1,4 @@
-/**
- * StreamHub – Cloudflare Worker v3
- * RTL Play + RTBF Auvio + TF1+
- *
- * GET /home               → { buckets[], heroBanners[], meta }
- * GET /list?theme=X&page=N → { items[], meta }        (RTBF + TF1 + RTL par thème)
- * GET /genres?theme=X     → { genres: {id,genres[]}[] }
- *
- * Bindings wrangler.toml :
- *   [ai]               binding = "AI"
- *   [[kv_namespaces]]  binding = "LABEL_CACHE"   (thèmes AI + genres AI)
- *   [[kv_namespaces]]  binding = "DATA_CACHE"    (données précalculées)
- *   [triggers]         crons = ["0 */3 * * *"]
- *
- * CF AI est utilisée pour :
- *   1. classifyWithWorkersAI   → labels catégorie inconnus → thème (LABEL_CACHE "label_map")
- *   2. classifyGenresWithAI    → titres sans genre → genres affichables (LABEL_CACHE "genres_map")
- *      Ces deux caches persistent 7 jours en KV — l'IA n'est appelée QUE pour les nouveaux labels.
- */
+
 
 export interface Env {
   AI: Ai;
