@@ -24,7 +24,7 @@ id = "6f4ca00fd81c4f6ea7fb0165f5973551"
 # KV pour le cache home (10 min)
 [[kv_namespaces]]
 binding = "KV"
-id      = "REMPLACER_PAR_VOTRE_KV_ID"
+id      = "af573fdcfed846d7b43e19f07111bad7"
 
 # Cron Trigger — rafraîchit les données toutes les 3h en background
 # Le worker tourne sans requête utilisateur, met à jour DATA_CACHE
